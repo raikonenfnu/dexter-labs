@@ -1,0 +1,154 @@
+"""DreamZero backbone shapes, taken from the upstream Hydra configs.
+
+Numbers match ``groot/vla/configs/model/dreamzero/action_head/`` in
+github.com/dreamzero0/dreamzero:
+``wan_flow_matching_action_tf.yaml`` (Wan2.1-I2V-14B, the released
+DreamZero-DROID checkpoint) and ``..._wan22.yaml`` (Wan2.2-TI2V-5B).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+__all__ = ["WAMConfig", "WAN21_I2V_14B", "WAN22_TI2V_5B", "PRESETS"]
+
+
+@dataclass(frozen=True)
+class WAMConfig:
+    """Shape of one World Action Model."""
+
+    name: str
+    model_type: str  # "i2v" | "ti2v"
+
+    # DiT
+    dim: int
+    ffn_dim: int
+    num_heads: int
+    num_layers: int
+    in_dim: int  # latent channels in
+    out_dim: int  # latent channels out
+    eps: float = 1e-6
+
+    # Text conditioning (umt5-xxl), cross-attended and cached per episode.
+    text_dim: int = 4096
+    text_len: int = 512
+
+    # Sequence layout
+    frame_seqlen: int = 880  # video tokens per frame after patch embedding
+    num_frame_per_block: int = 1
+    num_action_per_block: int = 32
+    num_state_per_block: int = 1
+
+    # Action head
+    action_dim: int = 32
+    max_state_dim: int = 64
+
+    # Flow-matching schedule
+    num_inference_steps: int = 4
+
+    @property
+    def head_dim(self) -> int:
+        if self.dim % self.num_heads:
+            raise ValueError(f"dim {self.dim} is not divisible by num_heads {self.num_heads}")
+        return self.dim // self.num_heads
+
+    @property
+    def video_tokens(self) -> int:
+        """Video tokens the DiT sees in one step."""
+        return self.frame_seqlen * self.num_frame_per_block
+
+    @property
+    def register_tokens(self) -> int:
+        """Action register: one action chunk plus the state token(s)."""
+        return self.num_action_per_block + self.num_state_per_block
+
+    @property
+    def seq_len(self) -> int:
+        """Query length of a single denoising step."""
+        return self.video_tokens + self.register_tokens
+
+    def parameters_per_layer(self) -> int:
+        d, f, t = self.dim, self.ffn_dim, self.text_dim
+        self_attn = 4 * d * d  # q, k, v, o
+        cross_attn = 2 * d * d + 2 * t * d  # q, o from x; k, v from text
+        ffn = 2 * d * f
+        return self_attn + cross_attn + ffn
+
+    def dit_parameters(self) -> int:
+        return self.num_layers * self.parameters_per_layer()
+
+    def weight_bytes(self, bits: int = 16, group_size: int = 128) -> int:
+        """Bytes of DiT weight the memory system must deliver per denoising step.
+
+        This is the quantity that sets the step time on a bandwidth-bound part,
+        so it includes the quantisation scales and zero points -- they are real
+        traffic, roughly ``2 * 2 / group_size`` bytes per weight.
+        """
+        params = self.dit_parameters()
+        if bits == 16:
+            return params * 2
+        overhead = 2 * 2 / group_size  # bf16 scale + bf16 zero per group
+        return int(params * (bits / 8 + overhead))
+
+    def flops_per_denoise_step(self) -> int:
+        """Multiply-accumulates x2 for one pass of ``seq_len`` tokens.
+
+        Attention's own QK/PV work is left out: at 83 tokens against a few
+        thousand cached keys it is under 2% of this, and including it would
+        imply a precision the rest of the estimate does not have.
+        """
+        return 2 * self.dit_parameters() * self.seq_len
+
+    def arithmetic_intensity(self, bits: int = 16, group_size: int = 128) -> float:
+        """FLOP per byte of weight traffic for one denoising step.
+
+        Compare against the machine balance (peak FLOP/s over achievable
+        bandwidth) to see which side of the roofline a configuration sits on.
+        Weight-only quantisation raises this ratio, so it moves a memory-bound
+        shape toward compute -- and stops paying once it arrives.
+        """
+        return self.flops_per_denoise_step() / self.weight_bytes(bits, group_size)
+
+    def describe(self) -> str:
+        return (
+            f"{self.name}: {self.dit_parameters()/1e9:.1f}B DiT params, "
+            f"{self.num_layers}L x dim {self.dim} x {self.num_heads}H "
+            f"(head_dim {self.head_dim}), ffn {self.ffn_dim}; "
+            f"{self.seq_len} tokens/step "
+            f"({self.video_tokens} video + {self.register_tokens} register)"
+        )
+
+
+# Released DreamZero-DROID checkpoint.
+WAN21_I2V_14B = WAMConfig(
+    name="dreamzero-droid-wan2.1-i2v-14b",
+    model_type="i2v",
+    dim=5120,
+    ffn_dim=13824,
+    num_heads=40,
+    num_layers=40,
+    in_dim=36,
+    out_dim=16,
+    frame_seqlen=880,
+    num_frame_per_block=1,
+    num_action_per_block=32,
+    num_state_per_block=1,
+)
+
+# Lower-VRAM backbone: 160x320 video -> 10x20 latent -> 5x10 = 50 tokens/frame.
+WAN22_TI2V_5B = WAMConfig(
+    name="dreamzero-wan2.2-ti2v-5b",
+    model_type="ti2v",
+    dim=3072,
+    ffn_dim=14336,
+    num_heads=24,
+    num_layers=30,
+    in_dim=48,
+    out_dim=48,
+    frame_seqlen=50,
+    num_frame_per_block=1,
+    num_action_per_block=32,
+    num_state_per_block=1,
+)
+
+PRESETS = {"14b": WAN21_I2V_14B, "5b": WAN22_TI2V_5B}
