@@ -21,6 +21,9 @@ def main() -> None:
                     help="override layer count (default: the full model)")
     ap.add_argument("--bits", type=int, default=None, choices=[4, 8],
                     help="weight-only quantisation (default: bf16)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="path to a released DreamZero checkpoint; without it the "
+                         "model runs on initialised weights and only the timing is real")
     ap.add_argument("--ticks", type=int, default=120)
     ap.add_argument("--control-hz", type=float, default=CONTROL_HZ)
     ap.add_argument("--horizon", type=int, default=OPEN_LOOP_HORIZON,
@@ -42,12 +45,24 @@ def main() -> None:
           f"open-loop horizon {args.horizon}, {args.ticks} ticks "
           f"({args.ticks / args.control_hz:.1f}s of robot time)\n")
 
-    model = CausalWanDiT(cfg)
-    if args.bits:
-        model.quantize_(bits=args.bits)
+    if args.checkpoint:
+        from dexter.models.dreamzero.checkpoint import load_dreamzero
+        print(f"loading {args.checkpoint}"
+              + (f" as int{args.bits}" if args.bits else " as bf16") + " ...")
+        model = load_dreamzero(args.checkpoint, cfg, bits=args.bits)
+        print(f"loaded: {model.weight_bytes() / 1e9:.2f} GB resident\n")
+    else:
+        model = CausalWanDiT(cfg)
+        if args.bits:
+            model.quantize_(bits=args.bits)
+        print("NOTE: initialised weights -- actions are not meaningful, "
+              "only the timing is real.\n")
+
     policy = DreamZeroPolicy(model, batch=1, cache_blocks=64)
-    policy.set_instruction(torch.randn(1, cfg.text_len, cfg.text_dim,
-                                       device="cuda", dtype=model.dtype))
+    policy.set_instruction(
+        torch.randn(1, cfg.text_len, cfg.text_dim, device="cuda", dtype=model.dtype),
+        torch.randn(1, 257, cfg.clip_dim, device="cuda", dtype=model.dtype),
+    )
 
     print(f"{'scheduler':<10} {'rate':>9}  {'calls':>9}  {'stalled':>19}  "
           f"{'worst':>10}  {'deadline misses':>19}")

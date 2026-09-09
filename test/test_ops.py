@@ -54,8 +54,9 @@ def test_qk_norm_rope():
     b, l, h, d = 1, 125, 24, 128
     q = torch.randn(b, l, h, d, device=DEV, dtype=DT)
     k = torch.randn_like(q)
-    qw = torch.randn(d, device=DEV, dtype=DT)
-    kw = torch.randn(d, device=DEV, dtype=DT)
+    # Wan's QK norm spans the whole projection, so the weight is h*d long.
+    qw = torch.randn(h * d, device=DEV, dtype=DT)
+    kw = torch.randn(h * d, device=DEV, dtype=DT)
     pos = torch.arange(l, device=DEV, dtype=torch.float32)[:, None]
     inv = 1.0 / (10000 ** (torch.arange(0, d, 2, device=DEV, dtype=torch.float32) / d))[None, :]
     cos, sin = torch.cos(pos * inv), torch.sin(pos * inv)

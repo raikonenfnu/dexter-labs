@@ -79,9 +79,14 @@ class DreamZeroPolicy:
         self.sigmas = flow_match_timesteps(self.cfg.num_inference_steps, device)
         self.ctx: CrossAttnCache | None = None
 
-    def set_instruction(self, text_embedding: torch.Tensor) -> None:
-        """Bind a language instruction. Call once, not once per step."""
-        self.ctx = self.model.project_context(text_embedding)
+    def set_instruction(self, text_embedding: torch.Tensor,
+                        clip_features: torch.Tensor | None = None) -> None:
+        """Bind a language instruction and, for i2v, the conditioning frame.
+
+        Call once per instruction, not once per step: both projections are
+        constant for the episode and cost 40 layers of GEMM to redo.
+        """
+        self.ctx = self.model.project_context(text_embedding, clip_features)
 
     def reset(self) -> None:
         self.kv_cache.reset()
@@ -89,7 +94,7 @@ class DreamZeroPolicy:
     @torch.inference_mode()
     def step(
         self,
-        latent: torch.Tensor,  # [B, video_tokens, in_dim] encoded observation
+        latent: torch.Tensor,  # [B, video_tokens, condition_dim] encoded observation
         state: torch.Tensor,  # [B, num_state_per_block, max_state_dim]
         *,
         generator: torch.Generator | None = None,
@@ -105,7 +110,12 @@ class DreamZeroPolicy:
             (self.batch, cfg.num_action_per_block, cfg.action_dim),
             device=self.device, dtype=self.dtype, generator=generator,
         )
-        video = torch.randn_like(latent)
+        # Only the denoised channels carry noise; `latent` is the conditioning
+        # half and is held fixed for the whole step.
+        video = torch.randn(
+            (self.batch, latent.shape[1], cfg.head_out_dim),
+            device=self.device, dtype=self.dtype, generator=generator,
+        )
 
         # Only the last denoising step writes the KV cache: the earlier ones
         # evaluate the same block at different noise levels, so caching any but
@@ -121,8 +131,10 @@ class DreamZeroPolicy:
                 end_evt = torch.cuda.Event(enable_timing=True)
                 start_evt.record()
 
+            model_input = torch.cat((video, latent), dim=-1) if cfg.condition_dim else video
             video_noise, action_noise = self._forward(
-                video, actions, state, timestep, kv_cache=self.kv_cache if i == last else None
+                model_input, actions, state, timestep,
+                kv_cache=self.kv_cache if i == last else None,
             )
 
             # Rectified-flow Euler: the model predicts velocity, so a step is a

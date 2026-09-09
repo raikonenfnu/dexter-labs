@@ -22,10 +22,12 @@ from dexter.runtime import capture_denoise_step
 
 
 def _inputs(cfg: WAMConfig, device, dtype):
-    latent = torch.randn(1, cfg.video_tokens, cfg.in_dim, device=device, dtype=dtype)
+    latent = torch.randn(1, cfg.video_tokens, cfg.condition_dim or cfg.patch_dim,
+                         device=device, dtype=dtype)
     state = torch.randn(1, cfg.num_state_per_block, cfg.max_state_dim, device=device, dtype=dtype)
     text = torch.randn(1, cfg.text_len, cfg.text_dim, device=device, dtype=dtype)
-    return latent, state, text
+    clip = torch.randn(1, 257, cfg.clip_dim, device=device, dtype=dtype)
+    return latent, state, text, clip
 
 
 def run(cfg: WAMConfig, *, bits: int | None, use_graph: bool,
@@ -38,9 +40,9 @@ def run(cfg: WAMConfig, *, bits: int | None, use_graph: bool,
     if bits is not None:
         model.quantize_(bits=bits)
 
-    latent, state, text = _inputs(cfg, "cuda", dtype)
+    latent, state, text, clip = _inputs(cfg, "cuda", dtype)
     policy = DreamZeroPolicy(model, batch=1, cache_blocks=4)
-    policy.set_instruction(text)
+    policy.set_instruction(text, clip)
 
     if use_graph:
         actions = torch.randn(1, cfg.num_action_per_block, cfg.action_dim, device="cuda", dtype=dtype)
@@ -71,6 +73,6 @@ def run(cfg: WAMConfig, *, bits: int | None, use_graph: bool,
         "host_ms": trace.host,
     }
 
-    del policy, model, latent, state, text
+    del policy, model, latent, state, text, clip
     torch.cuda.empty_cache()
     return result

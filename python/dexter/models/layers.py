@@ -81,3 +81,35 @@ class AffineLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Fused as adaln: LN(x) * (1 + (w - 1)) + b.
         return ops.adaln_modulate(x, self.weight - 1, self.bias, self.eps)
+
+
+class CategorySpecificLinear(nn.Module):
+    """A linear layer with one weight matrix per embodiment.
+
+    DreamZero trains across robots, so the action and state encoders carry a
+    separate ``[in, out]`` matrix per embodiment and select one by id. The
+    released DROID checkpoint has a single category, but keeping the axis means
+    an AgiBot or YAM checkpoint loads without a shape change.
+    """
+
+    def __init__(self, num_categories: int, in_features: int, out_features: int,
+                 dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.W = nn.Parameter(torch.zeros(num_categories, in_features, out_features, dtype=dtype))
+        self.b = nn.Parameter(torch.zeros(num_categories, out_features, dtype=dtype))
+
+    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(x, self.W[cat_ids]) + self.b[cat_ids].unsqueeze(1)
+
+
+class CategorySpecificMLP(nn.Module):
+    """Two category-specific linears with a ReLU between them."""
+
+    def __init__(self, num_categories: int, in_features: int, hidden: int,
+                 out_features: int, dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.layer1 = CategorySpecificLinear(num_categories, in_features, hidden, dtype)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden, out_features, dtype)
+
+    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+        return self.layer2(torch.relu(self.layer1(x, cat_ids)), cat_ids)

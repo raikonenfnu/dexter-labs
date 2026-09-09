@@ -28,6 +28,8 @@ class WAMConfig:
     in_dim: int  # latent channels in
     out_dim: int  # latent channels out
     eps: float = 1e-6
+    freq_dim: int = 256  # width of the sinusoidal timestep basis
+    patch_size: tuple[int, int, int] = (1, 2, 2)  # (t, h, w) patchification
 
     # Text conditioning (umt5-xxl), cross-attended and cached per episode.
     text_dim: int = 4096
@@ -42,6 +44,11 @@ class WAMConfig:
     # Action head
     action_dim: int = 32
     max_state_dim: int = 64
+    state_hidden: int = 1024  # hidden width of the state/action MLPs
+    num_embodiments: int = 1  # category-specific weights, one per embodiment
+
+    # i2v image conditioning: CLIP features cross-attended alongside text.
+    clip_dim: int = 1280
 
     # Flow-matching schedule
     num_inference_steps: int = 4
@@ -51,6 +58,41 @@ class WAMConfig:
         if self.dim % self.num_heads:
             raise ValueError(f"dim {self.dim} is not divisible by num_heads {self.num_heads}")
         return self.dim // self.num_heads
+
+    @property
+    def patch_dim(self) -> int:
+        """Input width of ``patch_embedding``.
+
+        Wan patchifies with a Conv3d of stride ``patch_size``, which is exactly
+        a linear map over ``in_dim * prod(patch_size)`` inputs. Storing it as
+        that linear keeps the GEMM path uniform, and the checkpoint's conv
+        weight reshapes into it without reordering.
+        """
+        t, h, w = self.patch_size
+        return self.in_dim * t * h * w
+
+    @property
+    def head_out_dim(self) -> int:
+        """Output width of the video head, before unpatchifying.
+
+        Also the width of the *noisy* part of the DiT input: the model denoises
+        ``out_dim`` channels and predicts exactly those.
+        """
+        t, h, w = self.patch_size
+        return self.out_dim * t * h * w
+
+    @property
+    def condition_dim(self) -> int:
+        """Width of the conditioning channels appended to the noisy latent.
+
+        Wan's i2v input is ``[noisy latent ; conditioning]`` along channels --
+        ``in_dim`` 36 is 16 denoised channels plus 20 carrying the first-frame
+        latent and its mask -- while ``out_dim`` is only the 16. So a denoising
+        step updates a ``head_out_dim``-wide tensor and re-concatenates the
+        conditioning, which is constant for the block. Zero for t2v/ti2v
+        backbones, where the latent is the whole input.
+        """
+        return self.patch_dim - self.head_out_dim
 
     @property
     def video_tokens(self) -> int:
@@ -130,9 +172,11 @@ WAN21_I2V_14B = WAMConfig(
     in_dim=36,
     out_dim=16,
     frame_seqlen=880,
-    num_frame_per_block=1,
-    num_action_per_block=32,
+    num_frame_per_block=2,
+    num_action_per_block=24,
     num_state_per_block=1,
+    action_dim=32,
+    max_state_dim=64,
 )
 
 # Lower-VRAM backbone: 160x320 video -> 10x20 latent -> 5x10 = 50 tokens/frame.

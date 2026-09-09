@@ -78,7 +78,8 @@ class ReachTask:
         and keeps the joint and gripper readings as the state vector, which is
         what the action register actually consumes.
         """
-        latent = torch.randn(1, cfg.video_tokens, cfg.in_dim, device=device, dtype=dtype)
+        latent = torch.randn(1, cfg.video_tokens, cfg.condition_dim or cfg.patch_dim,
+                             device=device, dtype=dtype)
         state = torch.zeros(1, cfg.num_state_per_block, cfg.max_state_dim,
                             device=device, dtype=dtype)
         state[0, 0, :7] = torch.from_numpy(self.joints).to(device=device, dtype=dtype)

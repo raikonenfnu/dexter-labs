@@ -41,7 +41,7 @@ def run(dim: int = 3072, ffn_dim: int = 14336, seq_len: int = 83,
 
     q = torch.randn(1, seq_len, heads, head_dim, device=dev, dtype=dtype)
     k = torch.randn_like(q)
-    qw = torch.ones(head_dim, device=dev, dtype=dtype)
+    qw = torch.ones(heads * head_dim, device=dev, dtype=dtype)
     pos = torch.arange(seq_len, device=dev, dtype=torch.float32)[:, None]
     inv = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=dev, dtype=torch.float32) / head_dim))[None, :]
     cos, sin = torch.cos(pos * inv).to(dtype), torch.sin(pos * inv).to(dtype)

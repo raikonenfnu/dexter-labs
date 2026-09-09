@@ -13,9 +13,17 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    out = x.float()
-    out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + eps)
-    return (out * weight.float()).to(x.dtype)
+    """Wan's QK norm: RMS over the whole ``dim``, across all heads together.
+
+    ``x`` arrives as ``[B, L, H, D]`` but the norm upstream is applied to the
+    ``[B, L, H*D]`` projection before it is split into heads, so the
+    denominator and the learned weight both span ``H*D``.
+    """
+    b, seq_len, heads, head_dim = x.shape
+    flat = x.reshape(b, seq_len, heads * head_dim).float()
+    flat = flat * torch.rsqrt(flat.pow(2).mean(-1, keepdim=True) + eps)
+    flat = flat * weight.float().reshape(1, 1, -1)
+    return flat.reshape(b, seq_len, heads, head_dim).to(x.dtype)
 
 
 @register("rope", "qk_norm_rope", name="torch_qk_norm_rope", priority=Priority.REFERENCE)

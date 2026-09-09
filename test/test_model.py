@@ -24,7 +24,8 @@ def policy():
 
 
 def _obs():
-    latent = torch.randn(1, TINY.video_tokens, TINY.in_dim, device="cuda", dtype=torch.bfloat16)
+    latent = torch.randn(1, TINY.video_tokens, TINY.condition_dim or TINY.patch_dim,
+                         device="cuda", dtype=torch.bfloat16)
     state = torch.randn(1, TINY.num_state_per_block, TINY.max_state_dim,
                         device="cuda", dtype=torch.bfloat16)
     return latent, state
@@ -86,14 +87,23 @@ def test_quantize_shrinks_weights_and_keeps_output_close(bits):
     dense_actions = pol.step(latent, state)
     dense_bytes = model.weight_bytes()
 
+    def block_bytes():
+        from dexter.models.layers import Linear
+        return sum(m.weight_bytes for b in model.blocks
+                   for m in b.modules() if isinstance(m, Linear))
+
+    dense_block_bytes = block_bytes()
     model.quantize_(bits=bits)
     pol.reset()
     pol.set_instruction(text)
     torch.manual_seed(0)
     quant_actions = pol.step(latent, state)
 
-    ratio = model.weight_bytes() / dense_bytes
-    assert ratio < (0.45 if bits == 4 else 0.75), f"weights only shrank to {ratio:.2f}"
+    # quantize_ deliberately packs the transformer stack only, leaving the
+    # embeddings and heads dense, so assert on what it actually claims.
+    ratio = block_bytes() / dense_block_bytes
+    assert ratio < (0.35 if bits == 4 else 0.6), f"blocks only shrank to {ratio:.2f}"
+    assert model.weight_bytes() < dense_bytes
     assert torch.isfinite(quant_actions).all()
     assert quant_actions.shape == dense_actions.shape
 

@@ -27,7 +27,9 @@ import torch.nn as nn
 
 from dexter import ops
 from dexter.models.dreamzero.config import WAMConfig
-from dexter.models.layers import AffineLayerNorm, Linear, RMSNorm
+from dexter.models.layers import (
+    AffineLayerNorm, CategorySpecificLinear, CategorySpecificMLP, Linear, RMSNorm,
+)
 
 
 class KVCache:
@@ -65,10 +67,13 @@ class KVCache:
 
 @dataclass
 class CrossAttnCache:
-    """Text keys and values, projected once per episode and reused every step."""
+    """Conditioning keys and values, projected once per episode.
 
-    k: list[torch.Tensor]
-    v: list[torch.Tensor]
+    One dict per layer, holding text ``k``/``v`` and, for i2v, the CLIP image
+    ``k_img``/``v_img`` as well.
+    """
+
+    layers: list[dict]
 
 
 def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -99,8 +104,10 @@ class SelfAttention(nn.Module):
         self.k = Linear(cfg.dim, cfg.dim, dtype=dtype)
         self.v = Linear(cfg.dim, cfg.dim, dtype=dtype)
         self.o = Linear(cfg.dim, cfg.dim, dtype=dtype)
-        self.q_norm = RMSNorm(cfg.head_dim, cfg.eps, dtype)
-        self.k_norm = RMSNorm(cfg.head_dim, cfg.eps, dtype)
+        # WanRMSNorm spans the full dim, not head_dim: the norm runs on the
+        # projection before it is split into heads.
+        self.q_norm = RMSNorm(cfg.dim, cfg.eps, dtype)
+        self.k_norm = RMSNorm(cfg.dim, cfg.eps, dtype)
         self.eps = cfg.eps
 
     def forward(self, x, cos, sin, kv_cache: KVCache | None, layer: int,
@@ -127,31 +134,60 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """Attention onto the umt5 text embedding. Text k/v are cached per episode."""
+    """Attention onto the conditioning tokens, cached per episode.
+
+    Wan's i2v variant attends to *two* conditioning streams with a shared
+    query: the umt5 text embedding and the CLIP image features of the first
+    frame. Their outputs are summed before the output projection. Both streams
+    are constant for an episode, so all four projections run once in
+    ``project_context`` and never again inside the control loop.
+
+    Note the context arriving here is already at ``dim``: the DiT projects text
+    through ``text_embedding`` and CLIP through ``img_emb`` before any block
+    sees it, so ``k``/``v`` are ``dim -> dim``, not ``text_dim -> dim``.
+    """
 
     def __init__(self, cfg: WAMConfig, dtype: torch.dtype) -> None:
         super().__init__()
         self.heads, self.head_dim = cfg.num_heads, cfg.head_dim
+        self.image_branch = cfg.model_type == "i2v"
         self.q = Linear(cfg.dim, cfg.dim, dtype=dtype)
-        self.k = Linear(cfg.text_dim, cfg.dim, dtype=dtype)
-        self.v = Linear(cfg.text_dim, cfg.dim, dtype=dtype)
+        self.k = Linear(cfg.dim, cfg.dim, dtype=dtype)
+        self.v = Linear(cfg.dim, cfg.dim, dtype=dtype)
         self.o = Linear(cfg.dim, cfg.dim, dtype=dtype)
-        self.q_norm = RMSNorm(cfg.head_dim, cfg.eps, dtype)
-        self.k_norm = RMSNorm(cfg.head_dim, cfg.eps, dtype)
+        self.q_norm = RMSNorm(cfg.dim, cfg.eps, dtype)
+        self.k_norm = RMSNorm(cfg.dim, cfg.eps, dtype)
+        if self.image_branch:
+            self.k_img = Linear(cfg.dim, cfg.dim, dtype=dtype)
+            self.v_img = Linear(cfg.dim, cfg.dim, dtype=dtype)
+            self.k_img_norm = RMSNorm(cfg.dim, cfg.eps, dtype)
         self.eps = cfg.eps
 
-    def project_context(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run once per episode; the result is what ``forward`` consumes."""
-        b, text_len, _ = context.shape
-        shape = (b, text_len, self.heads, self.head_dim)
-        k = self.k_norm(self.k(context).view(shape))
-        return k, self.v(context).view(shape)
+    def _heads(self, t: torch.Tensor) -> torch.Tensor:
+        return t.view(t.shape[0], t.shape[1], self.heads, self.head_dim)
 
-    def forward(self, x, k, v):
+    def _norm_heads(self, t: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+        """Norm across the full dim first, then split -- upstream's order."""
+        return self._heads(norm(t))
+
+    def project_context(self, text: torch.Tensor, image: torch.Tensor | None):
+        """Run once per episode; the result is what ``forward`` consumes."""
+        kv = {
+            "k": self._norm_heads(self.k(text), self.k_norm),
+            "v": self._heads(self.v(text)),
+        }
+        if self.image_branch and image is not None:
+            kv["k_img"] = self._norm_heads(self.k_img(image), self.k_img_norm)
+            kv["v_img"] = self._heads(self.v_img(image))
+        return kv
+
+    def forward(self, x, kv: dict):
         b, seq_len, _ = x.shape
-        q = self.q_norm(self.q(x).view(b, seq_len, self.heads, self.head_dim))
-        # Text is fully visible: no mask, no cache offset.
-        out = ops.blockwise_causal_attention(q, k, v)
+        q = self._norm_heads(self.q(x), self.q_norm)
+        # Conditioning is fully visible: no mask, no cache offset.
+        out = ops.blockwise_causal_attention(q, kv["k"], kv["v"])
+        if "k_img" in kv:
+            out = out + ops.blockwise_causal_attention(q, kv["k_img"], kv["v_img"])
         return self.o(out.reshape(b, seq_len, -1))
 
 
@@ -175,7 +211,7 @@ class DiTBlock(nn.Module):
         self.ffn_down = Linear(cfg.ffn_dim, cfg.dim, dtype=dtype)
         self.modulation = nn.Parameter(torch.randn(1, 6, cfg.dim, dtype=dtype) / cfg.dim ** 0.5)
 
-    def forward(self, x, e, cos, sin, ctx_k, ctx_v, kv_cache, layer, block_boundaries):
+    def forward(self, x, e, cos, sin, ctx, kv_cache, layer, block_boundaries):
         # e is [B, 6, C]; each part broadcasts over the sequence.
         m = (self.modulation + e).unsqueeze(2)  # [B, 6, 1, C]
         shift1, scale1, gate1, shift2, scale2, gate2 = m.unbind(dim=1)
@@ -186,7 +222,7 @@ class DiTBlock(nn.Module):
         )
         x = ops.gated_residual(x, y, gate1)
 
-        x = x + self.cross_attn(self.norm3(x), ctx_k, ctx_v)
+        x = x + self.cross_attn(self.norm3(x), ctx)
 
         y = self._ffn(ops.adaln_modulate(x, scale2, shift2, self.eps))
         return ops.gated_residual(x, y, gate2)
@@ -200,21 +236,57 @@ class DiTBlock(nn.Module):
         return self.ffn_down(nn.functional.gelu(self.ffn_up(x), approximate="tanh"))
 
 
-class ActionEncoder(nn.Module):
-    """Noisy actions + state + flow timestep -> action-register tokens."""
+def action_time_embedding(timesteps: torch.Tensor, tokens: int, dim: int) -> torch.Tensor:
+    """Sinusoidal encoding of the action flow time, ``[B] -> [B, tokens, dim]``.
+
+    Upstream builds this over a ``[B, T]`` timestep grid; every action in a
+    chunk shares one flow time, so the grid is a broadcast of the scalar.
+    """
+    half = dim // 2
+    exponent = -torch.arange(half, device=timesteps.device, dtype=torch.float32) * (
+        math.log(10000.0) / half
+    )
+    t = timesteps.float()[:, None, None].expand(-1, tokens, 1)
+    freqs = t * exponent.exp()[None, None, :]
+    return torch.cat((torch.sin(freqs), torch.cos(freqs)), dim=-1)
+
+
+class MultiEmbodimentActionEncoder(nn.Module):
+    """Noisy actions + flow timestep -> action-register tokens.
+
+    ``W1`` lifts the action, the sinusoidal flow time is concatenated, ``W2``
+    mixes the pair through a swish, and ``W3`` projects out. All three are
+    category-specific so one checkpoint serves several robots.
+    """
 
     def __init__(self, cfg: WAMConfig, dtype: torch.dtype) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.action_in = Linear(cfg.action_dim, cfg.dim, dtype=dtype)
-        self.state_in = Linear(cfg.max_state_dim, cfg.dim, dtype=dtype)
-        self.time_in = Linear(cfg.dim, cfg.dim, dtype=dtype)
+        self.dim = cfg.dim
+        n = cfg.num_embodiments
+        self.W1 = CategorySpecificLinear(n, cfg.action_dim, cfg.dim, dtype)
+        self.W2 = CategorySpecificLinear(n, 2 * cfg.dim, cfg.dim, dtype)
+        self.W3 = CategorySpecificLinear(n, cfg.dim, cfg.dim, dtype)
 
-    def forward(self, actions, state, timestep):
-        # actions [B, A, action_dim], state [B, S, max_state_dim], timestep [B]
-        t = self.time_in(sinusoidal_embedding(timestep, self.cfg.dim).to(actions.dtype))
-        action_tokens = self.action_in(actions) + t[:, None, :]
-        return torch.cat((action_tokens, self.state_in(state)), dim=1)
+    def forward(self, actions, timesteps, cat_ids):
+        a = self.W1(actions, cat_ids)
+        tau = action_time_embedding(timesteps, actions.shape[1], self.dim).to(a.dtype)
+        x = torch.cat((a, tau), dim=-1)
+        x = torch.nn.functional.silu(self.W2(x, cat_ids))  # swish
+        return self.W3(x, cat_ids)
+
+
+class CausalHead(nn.Module):
+    """Video output head: its own two-way modulation, then a projection."""
+
+    def __init__(self, cfg: WAMConfig, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.eps = cfg.eps
+        self.head = Linear(cfg.dim, cfg.head_out_dim, dtype=dtype)
+        self.modulation = nn.Parameter(torch.zeros(1, 2, cfg.dim, dtype=dtype))
+
+    def forward(self, x, e):
+        shift, scale = (self.modulation + e).unsqueeze(2).unbind(dim=1)
+        return self.head(ops.adaln_modulate(x, scale, shift, self.eps))
 
 
 class CausalWanDiT(nn.Module):
@@ -231,6 +303,16 @@ class CausalWanDiT(nn.Module):
         with torch.device(device):
             self._build(cfg, dtype)
         self.to(dtype=dtype)
+        self.rebuild_buffers(device)
+
+    def rebuild_buffers(self, device: torch.device | str) -> None:
+        """(Re)create the derived buffers on ``device``.
+
+        Separate from ``_build`` because a streaming checkpoint load builds the
+        module tree on ``meta`` -- rope tables and block boundaries are computed,
+        not loaded, so they have to be materialised once the real device is known.
+        """
+        cfg, dtype = self.cfg, self.dtype
         cos, sin = rope_tables(cfg.seq_len * 8, cfg.head_dim, device, dtype)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
@@ -244,14 +326,33 @@ class CausalWanDiT(nn.Module):
         )
 
     def _build(self, cfg: WAMConfig, dtype: torch.dtype) -> None:
-        self.patch_embed = Linear(cfg.in_dim, cfg.dim, dtype=dtype)
-        self.time_embed = Linear(cfg.dim, cfg.dim, dtype=dtype)
+        # Patchify. The checkpoint stores this as a Conv3d of stride patch_size,
+        # which is the same linear map over in_dim * prod(patch_size) inputs.
+        self.patch_embed = Linear(cfg.patch_dim, cfg.dim, dtype=dtype)
+
+        # Diffusion timestep: sinusoid(freq_dim) -> MLP -> 6 modulation vectors.
+        self.time_embed_in = Linear(cfg.freq_dim, cfg.dim, dtype=dtype)
+        self.time_embed_out = Linear(cfg.dim, cfg.dim, dtype=dtype)
         self.time_projection = Linear(cfg.dim, 6 * cfg.dim, dtype=dtype)
+
+        # Conditioning projections, both run once per episode.
+        self.text_embed_in = Linear(cfg.text_dim, cfg.dim, dtype=dtype)
+        self.text_embed_out = Linear(cfg.dim, cfg.dim, dtype=dtype)
+        if cfg.model_type == "i2v":
+            self.img_norm_in = AffineLayerNorm(cfg.clip_dim, cfg.eps, dtype)
+            self.img_proj_in = Linear(cfg.clip_dim, cfg.clip_dim, dtype=dtype)
+            self.img_proj_out = Linear(cfg.clip_dim, cfg.dim, dtype=dtype)
+            self.img_norm_out = AffineLayerNorm(cfg.dim, cfg.eps, dtype)
+
         self.blocks = nn.ModuleList(DiTBlock(cfg, dtype) for _ in range(cfg.num_layers))
-        self.head_norm = AffineLayerNorm(cfg.dim, cfg.eps, dtype)
-        self.video_out = Linear(cfg.dim, cfg.out_dim, dtype=dtype)
-        self.action_out = Linear(cfg.dim, cfg.action_dim, dtype=dtype)
-        self.action_encoder = ActionEncoder(cfg, dtype)
+        self.head = CausalHead(cfg, dtype)
+
+        # Action register: encoders in, decoder out. All category-specific.
+        self.action_encoder = MultiEmbodimentActionEncoder(cfg, dtype)
+        self.state_encoder = CategorySpecificMLP(
+            cfg.num_embodiments, cfg.max_state_dim, cfg.state_hidden, cfg.dim, dtype)
+        self.action_decoder = CategorySpecificMLP(
+            cfg.num_embodiments, cfg.dim, cfg.state_hidden, cfg.action_dim, dtype)
 
     @torch.no_grad()
     def quantize_(self, bits: int = 4, group_size: int = 128) -> "CausalWanDiT":
@@ -271,50 +372,71 @@ class CausalWanDiT(nn.Module):
     def weight_bytes(self) -> int:
         return sum(m.weight_bytes for m in self.modules() if isinstance(m, Linear))
 
-    def project_context(self, context: torch.Tensor) -> CrossAttnCache:
-        """Project the text embedding through every block's cross-attention.
+    def embed_text(self, text: torch.Tensor) -> torch.Tensor:
+        """umt5 embedding -> dim, through the DiT's own text MLP."""
+        return self.text_embed_out(
+            torch.nn.functional.gelu(self.text_embed_in(text), approximate="tanh")
+        )
 
-        Done once per language instruction. Inside the control loop the text is
-        constant, so these projections are pure waste if repeated -- which is
-        exactly the kind of per-step host work the upstream server pays.
+    def embed_image(self, clip: torch.Tensor) -> torch.Tensor:
+        """CLIP features of the conditioning frame -> dim."""
+        x = self.img_proj_in(self.img_norm_in(clip))
+        x = self.img_proj_out(torch.nn.functional.gelu(x, approximate="tanh"))
+        return self.img_norm_out(x)
+
+    def project_context(self, text: torch.Tensor,
+                        clip: torch.Tensor | None = None) -> CrossAttnCache:
+        """Project the conditioning through every block's cross-attention.
+
+        Done once per instruction. Inside the control loop the language and the
+        conditioning frame are constant, so repeating these projections every
+        denoising step would be pure waste -- exactly the kind of per-step work
+        the upstream blocking server pays for.
         """
-        ks, vs = [], []
-        for block in self.blocks:
-            k, v = block.cross_attn.project_context(context)
-            ks.append(k)
-            vs.append(v)
-        return CrossAttnCache(ks, vs)
+        context = self.embed_text(text)
+        image = self.embed_image(clip) if (clip is not None and hasattr(self, "img_proj_in")) else None
+        return CrossAttnCache([b.cross_attn.project_context(context, image) for b in self.blocks])
 
     def forward(
         self,
-        latent: torch.Tensor,  # [B, video_tokens, in_dim] noisy video latent
+        latent: torch.Tensor,  # [B, video_tokens, patch_dim] noisy, patchified
         actions: torch.Tensor,  # [B, num_action_per_block, action_dim] noisy actions
         state: torch.Tensor,  # [B, num_state_per_block, max_state_dim]
         timestep: torch.Tensor,  # [B] flow-matching time
         ctx: CrossAttnCache,
         kv_cache: KVCache | None = None,
+        embodiment: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(video_noise, action_noise)``."""
         cfg = self.cfg
-        video = self.patch_embed(latent)
-        register = self.action_encoder(actions, state, timestep)
-        x = torch.cat((video, register), dim=1)
+        if embodiment is None:
+            embodiment = torch.zeros(latent.shape[0], dtype=torch.long, device=latent.device)
 
-        t = self.time_embed(sinusoidal_embedding(timestep, cfg.dim).to(x.dtype))
-        e = self.time_projection(t).view(-1, 6, cfg.dim)
+        # [ video | actions | state ] -- one sequence through one transformer.
+        x = torch.cat((
+            self.patch_embed(latent),
+            self.action_encoder(actions, timestep, embodiment),
+            self.state_encoder(state, embodiment),
+        ), dim=1)
+
+        t = torch.nn.functional.silu(
+            self.time_embed_in(sinusoidal_embedding(timestep, cfg.freq_dim).to(x.dtype))
+        )
+        t = self.time_embed_out(t)
+        e = self.time_projection(torch.nn.functional.silu(t)).view(-1, 6, cfg.dim)
 
         seq_len = x.shape[1]
-        cos = self.rope_cos[:seq_len]
-        sin = self.rope_sin[:seq_len]
+        cos, sin = self.rope_cos[:seq_len], self.rope_sin[:seq_len]
 
         for layer, block in enumerate(self.blocks):
-            x = block(x, e, cos, sin, ctx.k[layer], ctx.v[layer], kv_cache, layer,
-                      self.block_boundaries)
+            x = block(x, e, cos, sin, ctx.layers[layer], kv_cache, layer, self.block_boundaries)
 
         if kv_cache is not None:
             kv_cache.commit(seq_len)
 
-        x = self.head_norm(x)
-        video_noise = self.video_out(x[:, : cfg.video_tokens])
-        action_noise = self.action_out(x[:, cfg.video_tokens : cfg.video_tokens + cfg.num_action_per_block])
+        # The head takes the raw time embedding; its own [1, 2, dim] modulation
+        # broadcasts against [B, 1, dim] to give the shift/scale pair.
+        video_noise = self.head(x[:, : cfg.video_tokens], t.unsqueeze(1))
+        action_slice = x[:, cfg.video_tokens : cfg.video_tokens + cfg.num_action_per_block]
+        action_noise = self.action_decoder(action_slice, embodiment)
         return video_noise, action_noise

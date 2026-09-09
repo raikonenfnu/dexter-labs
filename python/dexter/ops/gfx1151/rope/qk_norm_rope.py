@@ -1,9 +1,18 @@
-"""QK RMSNorm and rotary, fused.
+"""QK norm and rotary, fused.
 
-Wan normalises q and k then immediately rotates them. Separately those are four
-passes over the projections; here they are one. Each program owns a single
-``(token, head)`` pair, so the RMS reduction is over ``head_dim`` -- 128 values,
-comfortably one wave's worth at wave32.
+Wan normalises q and k then immediately rotates them, so separately these are
+four passes over the projections; here they are one.
+
+The subtlety is *what* the norm reduces over. ``WanRMSNorm(dim)`` is applied to
+the ``[B, L, dim]`` projection **before** it is reshaped into heads, so the RMS
+denominator spans every head, not each head separately, and the learned weight
+is ``dim`` long rather than ``head_dim``. Getting that wrong still runs and
+still trains -- it just quietly computes a different model, which is why the
+reference in ``ops/reference`` does the same reduction and the tests compare
+against it.
+
+One program therefore owns a whole token: a ``[heads, head_dim/2]`` tile, with
+the reduction over the full plane and the rotation applied per head.
 """
 
 from __future__ import annotations
@@ -20,45 +29,52 @@ from dexter.registry import Priority, register
 def _qk_norm_rope_kernel(
     q_ptr, k_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
     q_out_ptr, k_out_ptr,
-    n_heads, seq_len, head_dim, eps,
-    HALF: tl.constexpr, BLOCK: tl.constexpr,
+    seq_len, dim, eps,
+    HEADS: tl.constexpr, HALF: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    """One program per (batch*token, head).
+    """One program per (batch, token).
 
-    RoPE pairs element ``i`` with ``i + head_dim/2``, so the kernel loads the
-    two halves separately rather than loading the row and shuffling it.
+    RoPE pairs element ``i`` of a head with ``i + head_dim/2``, so the two
+    halves are loaded as separate tiles rather than loading the row and
+    shuffling it.
     """
     pid = tl.program_id(0)
-    token = (pid // n_heads) % seq_len  # position within the sequence, not the batch
+    token = pid % seq_len
 
-    half = tl.arange(0, BLOCK)
-    mask = half < HALF
+    heads = tl.arange(0, BLOCK_H)[:, None]
+    half = tl.arange(0, BLOCK_D)[None, :]
+    mask = (heads < HEADS) & (half < HALF)
 
-    base = pid * head_dim
-    q_lo = tl.load(q_ptr + base + half, mask=mask, other=0.0).to(tl.float32)
-    q_hi = tl.load(q_ptr + base + HALF + half, mask=mask, other=0.0).to(tl.float32)
-    k_lo = tl.load(k_ptr + base + half, mask=mask, other=0.0).to(tl.float32)
-    k_hi = tl.load(k_ptr + base + HALF + half, mask=mask, other=0.0).to(tl.float32)
+    head_dim = 2 * HALF
+    lo_off = heads * head_dim + half
+    hi_off = lo_off + HALF
+    base = pid * dim
 
-    # RMSNorm over the whole head_dim, i.e. both halves together.
-    q_inv = tl.rsqrt((tl.sum(q_lo * q_lo, 0) + tl.sum(q_hi * q_hi, 0)) / head_dim + eps)
-    k_inv = tl.rsqrt((tl.sum(k_lo * k_lo, 0) + tl.sum(k_hi * k_hi, 0)) / head_dim + eps)
+    q_lo = tl.load(q_ptr + base + lo_off, mask=mask, other=0.0).to(tl.float32)
+    q_hi = tl.load(q_ptr + base + hi_off, mask=mask, other=0.0).to(tl.float32)
+    k_lo = tl.load(k_ptr + base + lo_off, mask=mask, other=0.0).to(tl.float32)
+    k_hi = tl.load(k_ptr + base + hi_off, mask=mask, other=0.0).to(tl.float32)
 
-    qw_lo = tl.load(qw_ptr + half, mask=mask, other=0.0).to(tl.float32)
-    qw_hi = tl.load(qw_ptr + HALF + half, mask=mask, other=0.0).to(tl.float32)
-    kw_lo = tl.load(kw_ptr + half, mask=mask, other=0.0).to(tl.float32)
-    kw_hi = tl.load(kw_ptr + HALF + half, mask=mask, other=0.0).to(tl.float32)
+    # RMS over the whole [heads, head_dim] plane -- all heads together.
+    q_inv = tl.rsqrt((tl.sum(q_lo * q_lo) + tl.sum(q_hi * q_hi)) / dim + eps)
+    k_inv = tl.rsqrt((tl.sum(k_lo * k_lo) + tl.sum(k_hi * k_hi)) / dim + eps)
+
+    qw_lo = tl.load(qw_ptr + lo_off, mask=mask, other=0.0).to(tl.float32)
+    qw_hi = tl.load(qw_ptr + hi_off, mask=mask, other=0.0).to(tl.float32)
+    kw_lo = tl.load(kw_ptr + lo_off, mask=mask, other=0.0).to(tl.float32)
+    kw_hi = tl.load(kw_ptr + hi_off, mask=mask, other=0.0).to(tl.float32)
 
     q_lo, q_hi = q_lo * q_inv * qw_lo, q_hi * q_inv * qw_hi
     k_lo, k_hi = k_lo * k_inv * kw_lo, k_hi * k_inv * kw_hi
 
-    cos = tl.load(cos_ptr + token * HALF + half, mask=mask, other=0.0).to(tl.float32)
-    sin = tl.load(sin_ptr + token * HALF + half, mask=mask, other=0.0).to(tl.float32)
+    # Rotary is per head: the same cos/sin row serves every head.
+    cos = tl.load(cos_ptr + token * HALF + half, mask=half < HALF, other=0.0).to(tl.float32)
+    sin = tl.load(sin_ptr + token * HALF + half, mask=half < HALF, other=0.0).to(tl.float32)
 
-    tl.store(q_out_ptr + base + half, (q_lo * cos - q_hi * sin).to(q_out_ptr.dtype.element_ty), mask=mask)
-    tl.store(q_out_ptr + base + HALF + half, (q_hi * cos + q_lo * sin).to(q_out_ptr.dtype.element_ty), mask=mask)
-    tl.store(k_out_ptr + base + half, (k_lo * cos - k_hi * sin).to(k_out_ptr.dtype.element_ty), mask=mask)
-    tl.store(k_out_ptr + base + HALF + half, (k_hi * cos + k_lo * sin).to(k_out_ptr.dtype.element_ty), mask=mask)
+    tl.store(q_out_ptr + base + lo_off, (q_lo * cos - q_hi * sin).to(q_out_ptr.dtype.element_ty), mask=mask)
+    tl.store(q_out_ptr + base + hi_off, (q_hi * cos + q_lo * sin).to(q_out_ptr.dtype.element_ty), mask=mask)
+    tl.store(k_out_ptr + base + lo_off, (k_lo * cos - k_hi * sin).to(k_out_ptr.dtype.element_ty), mask=mask)
+    tl.store(k_out_ptr + base + hi_off, (k_hi * cos + k_lo * sin).to(k_out_ptr.dtype.element_ty), mask=mask)
 
 
 @register("rope", "qk_norm_rope", name="triton_qk_norm_rope_gfx1151",
@@ -69,11 +85,12 @@ def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, eps):
     q_out, k_out = torch.empty_like(q), torch.empty_like(k)
 
     half = head_dim // 2
-    _qk_norm_rope_kernel[(b * seq_len * heads,)](
+    _qk_norm_rope_kernel[(b * seq_len,)](
         q, k, q_weight, k_weight, cos.contiguous(), sin.contiguous(),
         q_out, k_out,
-        heads, seq_len, head_dim, eps,
-        HALF=half, BLOCK=triton.next_power_of_2(half),
-        num_warps=2,
+        seq_len, heads * head_dim, eps,
+        HEADS=heads, HALF=half,
+        BLOCK_H=triton.next_power_of_2(heads), BLOCK_D=triton.next_power_of_2(half),
+        num_warps=4,
     )
     return q_out, k_out
