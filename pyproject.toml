@@ -16,6 +16,7 @@ dev = ["pytest", "rich"]
 dexter-bench = "dexter.bench.__main__:main"
 dexter-demo = "dexter.demo.__main__:main"
 dexter-rollout = "dexter.demo.rollout_cli:main"
+dexter-pusht = "dexter.demo.pusht_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

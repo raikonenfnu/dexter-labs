@@ -70,3 +70,19 @@ def test_reported_rate_reflects_wall_time(policy):
                         open_loop_horizon=8)
     assert stats.achieved_hz == pytest.approx(stats.ticks / stats.wall_s)
     assert stats.achieved_hz <= 50.0 * 1.05
+
+
+def test_min_max_normalisation_round_trips():
+    """The PushT demo normalises outside the policy, so the arithmetic is ours.
+
+    LeRobot's MIN_MAX maps [lo, hi] onto [-1, 1]. Getting this wrong does not
+    raise -- it produces a policy that appears simply unable to do the task.
+    """
+    from dexter.demo.pusht import _min_max_to_unit, _unit_to_min_max
+
+    lo = torch.tensor([12.0, 25.0])
+    hi = torch.tensor([511.0, 511.0])
+    x = torch.tensor([[12.0, 268.0], [511.0, 25.0]])
+    unit = _min_max_to_unit(x, lo, hi)
+    assert unit.min() >= -1.0 - 1e-6 and unit.max() <= 1.0 + 1e-6
+    assert torch.allclose(_unit_to_min_max(unit, lo, hi), x, atol=1e-4)

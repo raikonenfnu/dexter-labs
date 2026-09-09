@@ -392,6 +392,53 @@ cross-attention, the action path -- was already correct and put the bug in the
 video output alone. Both now match at **+0.9999**. Guessing had cost hours
 before that; the differential took one run.
 
+## A robot completing a task
+
+The 14B world model predicts; it cannot drive anything here. One control block
+is ~24 s against DROID's 66 ms period, and that gap is arithmetic rather than
+engineering: 1785 tokens x 13.6B params x 4 denoising steps is ~195 TFLOP per
+control step, so even at 100% of this machine's measured 29.5 TFLOP/s the floor
+is 6.6 s. Two orders of magnitude from FLOPs alone.
+
+So to watch a policy actually finish something, `dexter-pusht` runs a small
+trained policy on a real simulated task — PushT, where a 2-DoF end effector
+must shove a T-block onto a target outline, scored by coverage with a 0.95
+success threshold.
+
+```
+$ dexter-pusht --episodes 10
+lerobot/diffusion_pusht: 262.7M params on cuda
+
+  episode 2: best coverage 0.952  SOLVED    127 steps in 33.2s (3.8 Hz)
+  episode 5: best coverage 0.954  SOLVED    289 steps in 76.8s (3.8 Hz)
+  episode 9: best coverage 0.963  SOLVED    138 steps in 37.3s (3.7 Hz)
+  episode 8: best coverage 0.234  unsolved  300 steps in 78.8s (3.8 Hz)
+
+7/10 episodes solved (coverage > 0.95); median best coverage 0.951
+```
+
+It shares the shape of DreamZero's problem — observe, denoise an action chunk,
+execute part of it, re-plan — at three orders of magnitude less model. It does
+not share the backbone, so it runs through LeRobot rather than dexter ops.
+
+### Two things that made it look broken
+
+**The normalisation statistics silently did not load.** `from_pretrained` on
+the published checkpoint emits `Unexpected key(s): normalize_inputs.*` as a
+warning and continues, because this lerobot version moved normalisation out of
+the policy. The result is a policy running on unnormalised inputs, which scores
+**0.00 coverage on every episode** — indistinguishable from a policy that
+simply cannot do the task. The demo now reads the statistics out of the
+checkpoint itself and applies them explicitly, which is also version-proof: the
+arithmetic is fixed by the checkpoint rather than by whichever lerobot is
+installed.
+
+**Reward is not coverage.** PushT's reward is
+`clip(coverage / 0.95, 0, 1)`, so it saturates at 1.00 for anything at or above
+threshold. Reporting it as "coverage" showed episodes at 1.00 that the env had
+not marked solved. The demo reports `info["coverage"]` and `info["is_success"]`
+instead — which lowered the headline number and made it true.
+
 ## Layout
 
 ```
@@ -411,8 +458,9 @@ python/dexter/
   runtime/graph.py     HIP graph capture of the denoise step
   demo/robot.py        closed-loop arm, blocking vs pipelined chunk scheduling
   demo/rollout.py      world-model rollout from a real frame
+  demo/pusht.py        a small policy solving a real task, end to end
   bench/               roofline, kernel microbench, end-to-end
-test/                  40 tests: kernels vs references, model, scheduler, layouts
+test/                  41 tests: kernels vs references, model, scheduler, layouts
 ```
 
 Adding an architecture is one row in `platform._AMD_ARCHS` plus a directory of
@@ -442,9 +490,13 @@ pytest test -q
 
 ## What is not here
 
-* **A robot.** The rollout is the model imagining, not an arm executing. At
-  ~24 s per block nothing here drives hardware in real time; closing that needs
-  the quantised GEMM work above, and probably a smaller backbone.
+* **DreamZero driving a robot.** The rollout is the model imagining, not an arm
+  executing, and `dexter-pusht` is a different, much smaller policy. Closing
+  that gap needs a ~5B backbone: DreamZero ships the recipe
+  (`docs/WAN22_BACKBONE.md`, 83 tokens/step instead of 1785) but no released
+  weights for it, so it would have to be trained. The engine work here —
+  kernels, int4, chunk scheduling — applies unchanged if such a checkpoint
+  existed; the 5B shape already measures 361 ms/step and pipelines to 14.5 Hz.
 * **The fused VAE Conv3D** from the post. The VAE is vendored torch, which is
   the right call while it is 2% of the step, and the wrong one once the DiT
   gets faster.
