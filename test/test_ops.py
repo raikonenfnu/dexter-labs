@@ -133,3 +133,31 @@ def test_attention_survives_extreme_scores(scale, sign):
     assert torch.isfinite(got.float()).all(), "attention produced non-finite output"
     exp = ref("attention", "blockwise_causal")(q, k, v, None, 0, bb, None)
     close(got, exp, tol=3e-2)
+
+
+def test_patch_conventions_differ_between_input_and_output():
+    """The DiT reads its input channel-first and writes its output channel-last.
+
+    patchify feeds a Conv3d (c, kt, kh, kw); unpatchify reads a Linear's output
+    (pt, ph, pw, c). Treating them as inverses silently transposes every
+    predicted frame into noise, which is exactly what it did.
+    """
+    from dexter.perception.encode import patchify, patchify_output, unpatchify
+    x = torch.randn(1, 16, 2, 8, 10)
+    # Each is the inverse of its own partner...
+    assert torch.equal(unpatchify(patchify_output(x), (2, 4, 5), 16), x)
+    # ...and the two conventions genuinely differ.
+    assert not torch.equal(patchify(x), patchify_output(x))
+
+
+def test_input_and_output_patch_inverses_are_distinct():
+    """Each layout has its own inverse, and they must not be swapped."""
+    from dexter.perception.encode import (
+        patchify, patchify_output, unpatchify, unpatchify_input,
+    )
+    x = torch.randn(1, 16, 2, 8, 10)
+    grid = (2, 4, 5)
+    assert torch.equal(unpatchify_input(patchify(x), grid, 16), x)
+    assert torch.equal(unpatchify(patchify_output(x), grid, 16), x)
+    # Swapping them survives the shape check but scrambles each patch.
+    assert not torch.equal(unpatchify(patchify(x), grid, 16), x)

@@ -34,9 +34,12 @@ def _qk_norm_rope_kernel(
 ):
     """One program per (batch, token).
 
-    RoPE pairs element ``i`` of a head with ``i + head_dim/2``, so the two
-    halves are loaded as separate tiles rather than loading the row and
-    shuffling it.
+    Wan pairs *adjacent* elements -- ``x.reshape(..., head_dim/2, 2)`` -- so
+    element ``2j`` rotates against ``2j+1``. This is not the split-half
+    convention (``i`` against ``i + head_dim/2``) that most LLM RoPE uses, and
+    the two are not interchangeable: the wrong one still runs, still produces
+    finite output, and quietly destroys spatial structure. The two halves of a
+    pair are therefore loaded as stride-2 tiles.
     """
     pid = tl.program_id(0)
     token = pid % seq_len
@@ -46,8 +49,9 @@ def _qk_norm_rope_kernel(
     mask = (heads < HEADS) & (half < HALF)
 
     head_dim = 2 * HALF
-    lo_off = heads * head_dim + half
-    hi_off = lo_off + HALF
+    # Adjacent pairing: element 2j and 2j+1 of each head.
+    lo_off = heads * head_dim + 2 * half
+    hi_off = lo_off + 1
     base = pid * dim
 
     q_lo = tl.load(q_ptr + base + lo_off, mask=mask, other=0.0).to(tl.float32)

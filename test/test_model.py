@@ -39,20 +39,25 @@ def test_step_shape_and_finiteness(policy):
     assert torch.isfinite(actions).all()
 
 
-def test_kv_cache_advances_one_block_per_step(policy):
+def test_kv_cache_holds_only_clean_video_tokens(policy):
+    """History grows by one block of *video* tokens per control step.
+
+    Not `seq_len`: the action register is never committed. The cache is
+    extended by a priming pass on the denoised latent, which runs video-only at
+    timestep 0, so what a later block attends to is exclusively clean frames --
+    never an action chunk and never a half-denoised intermediate.
+    """
     latent, state = _obs()
     policy.reset()
     assert policy.kv_cache.length == 0
     for i in range(1, 4):
         policy.step(latent, state)
-        # Exactly one block per control step, regardless of denoising steps --
-        # only the last denoising pass may write history.
-        assert policy.kv_cache.length == i * TINY.seq_len
+        assert policy.kv_cache.length == i * TINY.video_tokens
 
 
 def test_kv_cache_overflow_is_an_error():
     model = CausalWanDiT(TINY)
-    pol = DreamZeroPolicy(model, batch=1, cache_blocks=1)
+    pol = DreamZeroPolicy(model, batch=1, cache_blocks=0)
     pol.set_instruction(torch.randn(1, TINY.text_len, TINY.text_dim,
                                     device="cuda", dtype=torch.bfloat16))
     latent, state = _obs()

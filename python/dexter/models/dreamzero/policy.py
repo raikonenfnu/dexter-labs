@@ -16,6 +16,7 @@ import torch
 
 from dexter.models.dreamzero.config import WAMConfig
 from dexter.models.dreamzero.model import CausalWanDiT, CrossAttnCache, KVCache
+from dexter.perception.encode import output_to_input_order, unpatchify_input
 
 
 @dataclass
@@ -70,14 +71,21 @@ class DreamZeroPolicy:
 
         device, dtype = next(model.parameters()).device, model.dtype
         self.device, self.dtype = device, dtype
+        # Only clean *video* tokens are ever committed -- never the action
+        # register -- so the cache is sized from frame_seqlen, not seq_len.
+        # One priming frame, then num_frame_per_block frames per control step.
         self.kv_cache = KVCache(
             layers=self.cfg.num_layers, batch=batch,
-            capacity=self.cfg.seq_len * cache_blocks,
+            capacity=self.cfg.frame_seqlen
+            * (1 + cache_blocks * self.cfg.num_frame_per_block),
             heads=self.cfg.num_heads, head_dim=self.cfg.head_dim,
             device=device, dtype=dtype,
         )
         self.sigmas = flow_match_timesteps(self.cfg.num_inference_steps, device)
         self.ctx: CrossAttnCache | None = None
+        # Kept so a rollout can re-project the image branch each step without
+        # re-running the 11 GB text tower for an instruction that has not changed.
+        self.text_embedding: torch.Tensor | None = None
 
     def set_instruction(self, text_embedding: torch.Tensor,
                         clip_features: torch.Tensor | None = None) -> None:
@@ -86,10 +94,37 @@ class DreamZeroPolicy:
         Call once per instruction, not once per step: both projections are
         constant for the episode and cost 40 layers of GEMM to redo.
         """
+        self.text_embedding = text_embedding
         self.ctx = self.model.project_context(text_embedding, clip_features)
 
     def reset(self) -> None:
         self.kv_cache.reset()
+        self.model.start_frame = 0
+
+    @torch.inference_mode()
+    def prime(self, clean_latent: torch.Tensor) -> None:
+        """Show the model a *clean* observed frame to fill the KV cache.
+
+        This is the step whose absence makes everything else look broken. A
+        causal video model denoises the next block by attending to the clean
+        history in its cache; with an empty cache the very first block is being
+        asked to imagine a scene it has never been shown, and it returns noise
+        that is individually plausible and collectively meaningless.
+
+        Upstream runs exactly this pass first: the observed latent at timestep
+        0, with no action register, purely to populate the cache. ``clean_latent``
+        is ``[B, frame_seqlen * frames, patch_dim]`` -- the real latent in the
+        noisy channels, its conditioning in the rest.
+        """
+        if self.ctx is None:
+            raise RuntimeError("call set_instruction() before priming")
+        frames = clean_latent.shape[1] // self.cfg.frame_seqlen
+        self.model(
+            clean_latent, None, None,
+            torch.zeros(self.batch, device=self.device),
+            self.ctx, self.kv_cache, frames=frames, write_cache=True,
+        )
+        self.model.start_frame += frames
 
     @torch.inference_mode()
     def step(
@@ -99,8 +134,18 @@ class DreamZeroPolicy:
         *,
         generator: torch.Generator | None = None,
         trace: StepTrace | None = None,
-    ) -> torch.Tensor:
-        """Denoise one action chunk. Returns ``[B, num_action_per_block, action_dim]``."""
+        return_video: bool = False,
+        commit: bool = True,
+    ):
+        """Denoise one action chunk.
+
+        Returns ``[B, num_action_per_block, action_dim]``, or with
+        ``return_video`` also the denoised video latent for this block --
+        DreamZero predicts the future it expects its own actions to produce, and
+        that prediction is what makes it a *world* action model rather than a
+        policy. Decoding it is the only way to see what the model thinks is
+        about to happen.
+        """
         if self.ctx is None:
             raise RuntimeError("call set_instruction() before stepping")
         cfg = self.cfg
@@ -110,6 +155,7 @@ class DreamZeroPolicy:
             (self.batch, cfg.num_action_per_block, cfg.action_dim),
             device=self.device, dtype=self.dtype, generator=generator,
         )
+        frames = latent.shape[1] // cfg.frame_seqlen
         # Only the denoised channels carry noise; `latent` is the conditioning
         # half and is held fixed for the whole step.
         video = torch.randn(
@@ -117,10 +163,8 @@ class DreamZeroPolicy:
             device=self.device, dtype=self.dtype, generator=generator,
         )
 
-        # Only the last denoising step writes the KV cache: the earlier ones
-        # evaluate the same block at different noise levels, so caching any but
-        # the final pass would poison the history with intermediate states.
-        last = cfg.num_inference_steps - 1
+        # Every step reads the cache; none of them writes it. The history is
+        # extended afterwards, by priming on the *clean* result.
         for i in range(cfg.num_inference_steps):
             sigma, next_sigma = self.sigmas[i], self.sigmas[i + 1]
             timestep = sigma.expand(self.batch) * 1000.0
@@ -133,15 +177,20 @@ class DreamZeroPolicy:
 
             model_input = torch.cat((video, latent), dim=-1) if cfg.condition_dim else video
             video_noise, action_noise = self._forward(
-                model_input, actions, state, timestep,
-                kv_cache=self.kv_cache if i == last else None,
+                model_input, actions, state, timestep, kv_cache=self.kv_cache
             )
 
             # Rectified-flow Euler: the model predicts velocity, so a step is a
             # straight line in the direction it points.
+            #
+            # video_noise arrives in the head's channel-last layout while
+            # `video` is in the patch-embedding's channel-first one, so it has
+            # to be re-laid before the two can be added.
             dt = next_sigma - sigma
             actions = actions + dt * action_noise
-            video = video + dt * video_noise
+            video = video + dt * output_to_input_order(
+                video_noise, (frames, cfg.latent_height, cfg.latent_width), cfg.out_dim
+            )
 
             if trace is not None:
                 end_evt.record()
@@ -149,13 +198,23 @@ class DreamZeroPolicy:
                 device_ms = start_evt.elapsed_time(end_evt)
                 trace.denoise.append(device_ms)
 
+        # Extend the history with what was just denoised, clean, exactly as the
+        # priming pass does. This is the only thing that ever enters the cache.
+        if commit:
+            self.prime(torch.cat((video, latent), dim=-1) if cfg.condition_dim else video)
+
         if trace is None:
             torch.cuda.synchronize()
         total = (time.perf_counter() - wall_start) * 1e3
         if trace is not None:
             trace.total = total
             trace.host = max(total - trace.device, 0.0)
-        return actions
+        if not return_video:
+            return actions
+        # Hand back the latent, not tokens: the caller should never have to know
+        # which of the two patch layouts this happens to be in.
+        grid = (frames, cfg.latent_height, cfg.latent_width)
+        return actions, unpatchify_input(video, grid, cfg.out_dim, cfg.patch_size)
 
     def _forward(self, video, actions, state, timestep, kv_cache):
         if self.runner is not None and kv_cache is None:

@@ -324,6 +324,74 @@ initialised weights never produce scores extreme enough to reach it; the real
 checkpoint does by layer 33. There is now a regression test that drives
 attention with deliberately extreme scores.
 
+## World-model rollout on real robot data
+
+`dexter-rollout` takes a real DROID camera frame and a real instruction, and
+lets the model dream forward: it predicts the video its own actions would
+produce, decodes it, and feeds the last frame back as the next observation.
+
+```
+$ dexter-rollout --checkpoint ~/nod/checkpoints/DreamZero-DROID \
+    --video exterior_image_1_left.mp4 \
+    --prompt "pick up the black bowl and place it on the plate" --steps 3
+
+encoding instruction: "pick up the black bowl and place it on the plate"
+  text (1, 512, 4096), text tower released
+loading DiT as int4 ...
+  9.06 GB resident
+dreaming 3 blocks forward ...
+wrote dream.mp4: 16 frames (23.6 s per block)
+action trajectory (72, 32)
+  joint deltas |mean| = 0.0433, max = 0.1328
+```
+
+The predicted frames are coherent: the stove, pan, grates and counter stay put
+and stay recognisable, and the scene drifts gradually as the rollout proceeds.
+Divergence from the observation grows smoothly — mean absolute difference 6.2
+at the first predicted frame, 25.4 by the sixteenth — which is what a world
+model dreaming forward should do, rather than either freezing or exploding.
+
+The full stack runs on one 32 GB APU by never holding two large models at once:
+umt5-xxl (11.4 GB) encodes the instruction and is released before the 9 GB int4
+DiT is loaded; the VAE and CLIP tower are 1.5 GB together.
+
+### Getting there: four bugs that all ran fine
+
+Every one of these produced finite, plausible-looking output and passed the
+test suite. None of them threw.
+
+1. **Flat 1D rotary.** Wan gives video tokens a *3D* rotary -- `head_dim` split
+   44/42/42 across time, height and width -- with the action register on its
+   own 1D rotary. A flat rotary over sequence position leaves the model unable
+   to tell which patch is where.
+2. **Split-half rotary pairing.** Wan pairs *adjacent* elements
+   (`reshape(..., d/2, 2)`), not `i` with `i + d/2`. The two are not
+   interchangeable.
+3. **No cache priming.** A causal video model denoises by attending to clean
+   history. Upstream first runs the observed frame at timestep 0, with no
+   action register, purely to fill the KV cache. Denoising the first block
+   against an empty cache asks the model to imagine a scene it was never shown.
+   Reading and writing the cache are also separate decisions: every denoising
+   step reads, only a priming pass writes, and it writes clean latents.
+4. **Two patch conventions, silently mixed.** This was the expensive one. The
+   DiT reads its input channel-first -- `patch_embedding` is a Conv3d, so a
+   token is `(c, kt, kh, kw)` -- and writes its output channel-*last*, because
+   upstream reads the head back with `view(B, f, h, w, pt, ph, pw, c)`. Input
+   and output are therefore **not** inverses. Mixing them in
+   `x = x + dt * v` type-checks, runs, and scrambles every patch; using the
+   wrong inverse when decoding leaves the image intact but adds a regular grid
+   at the patch pitch. `patchify`/`unpatchify_input` and
+   `patchify_output`/`unpatchify` are now separate pairs, each matching the end
+   it serves, with a test asserting they are distinct.
+
+What made these findable was running upstream's own `CausalWanModel` on
+identical weights and inputs and diffing the outputs. That immediately split
+the problem: `action_noise` matched at **corr +0.9999** while `video_noise` sat
+at **+0.07**, which proved the entire trunk -- attention, modulation,
+cross-attention, the action path -- was already correct and put the bug in the
+video output alone. Both now match at **+0.9999**. Guessing had cost hours
+before that; the differential took one run.
+
 ## Layout
 
 ```
@@ -339,10 +407,12 @@ python/dexter/
     layers.py          Linear that swaps dense <-> packed in place
     dreamzero/         config, DiT, closed-loop policy
       checkpoint.py    streaming loader: meta build, pack-as-you-go, one shard mapped
+  perception/          vendored Wan VAE, CLIP and umt5 + conditioning encoder
   runtime/graph.py     HIP graph capture of the denoise step
   demo/robot.py        closed-loop arm, blocking vs pipelined chunk scheduling
+  demo/rollout.py      world-model rollout from a real frame
   bench/               roofline, kernel microbench, end-to-end
-test/                  37 tests: kernels vs references, model, scheduler
+test/                  40 tests: kernels vs references, model, scheduler, layouts
 ```
 
 Adding an architecture is one row in `platform._AMD_ARCHS` plus a directory of
@@ -372,10 +442,11 @@ pytest test -q
 
 ## What is not here
 
-* **The three encoders.** The DiT runs on real weights; the VAE, CLIP and umt5
-  encoders around it do not exist here, so observations and instructions enter
-  as correctly-shaped placeholders. This is the gap between "the engine runs the
-  model" and "the robot does the task", and it is the next thing to build. The
-  fused Conv3D from the post is part of that VAE work.
+* **A robot.** The rollout is the model imagining, not an arm executing. At
+  ~24 s per block nothing here drives hardware in real time; closing that needs
+  the quantised GEMM work above, and probably a smaller backbone.
+* **The fused VAE Conv3D** from the post. The VAE is vendored torch, which is
+  the right call while it is 2% of the step, and the wrong one once the DiT
+  gets faster.
 * **A competitive int4 GEMM.** Diagnosed, not fixed. See above.
 * **Multi-GPU.** Upstream shards across 2+ GPUs; this is a single-APU engine.

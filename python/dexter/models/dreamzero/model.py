@@ -86,11 +86,56 @@ def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.cat((torch.cos(args), torch.sin(args)), dim=-1)
 
 
-def rope_tables(seq_len: int, head_dim: int, device, dtype, base: float = 10000.0):
-    """``(cos, sin)`` of shape ``[seq_len, head_dim // 2]``."""
-    inv = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    pos = torch.arange(seq_len, device=device, dtype=torch.float32)
-    angles = pos[:, None] * inv[None, :]
+def _rope_axis(positions: torch.Tensor, dim: int, base: float = 10000.0) -> torch.Tensor:
+    """Rotation angles for one axis: ``[len(positions), dim // 2]``."""
+    inv = 1.0 / (base ** (torch.arange(0, dim, 2, device=positions.device,
+                                       dtype=torch.float32) / dim))
+    return positions.float()[:, None] * inv[None, :]
+
+
+def rope_tables(cfg: WAMConfig, grid: tuple[int, int, int], start_frame: int,
+                device, dtype, register_tokens: int | None = None):
+    """``(cos, sin)`` of shape ``[seq_len, head_dim // 2]`` for one step.
+
+    Wan does **not** use one 1D rotary over the flat sequence. Video tokens get
+    a *3D* rotary: ``head_dim`` is split across time, height and width, so a
+    token carries its ``(f, h, w)`` position in the patch grid and attention
+    scores depend on relative position in all three. The split is Wan's:
+
+        time   dim - 4 * (dim // 6)     = 44 of 128
+        height 2 * (dim // 6)           = 42
+        width  2 * (dim // 6)           = 42
+
+    The action register is not video and does not live on that grid, so its
+    tokens get their own 1D rotary over chunk index instead, concatenated after
+    the video positions.
+
+    Using a flat 1D rotary for everything runs, stays finite, and produces
+    coloured noise -- the model cannot recover which patch is where.
+    """
+    frames, height, width = grid
+    d = cfg.head_dim
+    sixth = d // 6
+    dim_t, dim_h, dim_w = d - 4 * sixth, 2 * sixth, 2 * sixth
+
+    ar = lambda n: torch.arange(n, device=device)  # noqa: E731
+    # Time positions are absolute across the episode, so a cached block keeps
+    # the position it had when it was written.
+    t = _rope_axis(ar(frames) + start_frame, dim_t)[:, None, None, :].expand(frames, height, width, -1)
+    h = _rope_axis(ar(height), dim_h)[None, :, None, :].expand(frames, height, width, -1)
+    w = _rope_axis(ar(width), dim_w)[None, None, :, :].expand(frames, height, width, -1)
+    video = torch.cat((t, h, w), dim=-1).reshape(frames * height * width, d // 2)
+
+    # One 1D rotary shared by the action chunk and the state token, indexed by
+    # their position within the register. A cache-priming pass carries no
+    # register at all, so it asks for zero of them.
+    n_register = cfg.register_tokens if register_tokens is None else register_tokens
+    if n_register:
+        block = start_frame // max(cfg.num_frame_per_block, 1)
+        register_pos = ar(n_register) + block * n_register
+        angles = torch.cat((video, _rope_axis(register_pos, d)), dim=0)
+    else:
+        angles = video
     return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
 
@@ -111,7 +156,7 @@ class SelfAttention(nn.Module):
         self.eps = cfg.eps
 
     def forward(self, x, cos, sin, kv_cache: KVCache | None, layer: int,
-                block_boundaries: torch.Tensor | None):
+                block_boundaries: torch.Tensor | None, write: bool = False):
         b, seq_len, _ = x.shape
         shape = (b, seq_len, self.heads, self.head_dim)
         q = self.q(x).view(shape)
@@ -120,8 +165,13 @@ class SelfAttention(nn.Module):
 
         q, k = ops.qk_norm_rope(q, k, self.q_norm.weight, self.k_norm.weight, cos, sin, self.eps)
 
+        # Reading and writing the cache are separate decisions. Every denoising
+        # step *reads* the clean history; only a priming pass *writes*, and it
+        # writes clean latents. Writing the intermediate states of a denoising
+        # loop would fill the history with half-noised frames the model never
+        # saw in training.
         cache_len = kv_cache.length if kv_cache is not None else 0
-        if kv_cache is not None:
+        if kv_cache is not None and write:
             kv_cache.append(layer, k, v)
 
         out = ops.blockwise_causal_attention(
@@ -211,14 +261,14 @@ class DiTBlock(nn.Module):
         self.ffn_down = Linear(cfg.ffn_dim, cfg.dim, dtype=dtype)
         self.modulation = nn.Parameter(torch.randn(1, 6, cfg.dim, dtype=dtype) / cfg.dim ** 0.5)
 
-    def forward(self, x, e, cos, sin, ctx, kv_cache, layer, block_boundaries):
+    def forward(self, x, e, cos, sin, ctx, kv_cache, layer, block_boundaries, write=False):
         # e is [B, 6, C]; each part broadcasts over the sequence.
         m = (self.modulation + e).unsqueeze(2)  # [B, 6, 1, C]
         shift1, scale1, gate1, shift2, scale2, gate2 = m.unbind(dim=1)
 
         y = self.self_attn(
             ops.adaln_modulate(x, scale1, shift1, self.eps),
-            cos, sin, kv_cache, layer, block_boundaries,
+            cos, sin, kv_cache, layer, block_boundaries, write,
         )
         x = ops.gated_residual(x, y, gate1)
 
@@ -313,17 +363,15 @@ class CausalWanDiT(nn.Module):
         not loaded, so they have to be materialised once the real device is known.
         """
         cfg, dtype = self.cfg, self.dtype
-        cos, sin = rope_tables(cfg.seq_len * 8, cfg.head_dim, device, dtype)
+        self.start_frame = 0          # advanced by the policy as blocks are committed
+        self._rope_key = None         # (grid, start_frame, n_register) of the cached table
+        cos, sin = rope_tables(cfg, cfg.patch_grid, 0, device, dtype)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
         # Video tokens form one block, the action register a second. Built once:
         # allocating it inside forward would stall the step and, more sharply,
         # make the step impossible to capture into a graph.
-        self.register_buffer(
-            "block_boundaries",
-            torch.tensor([0, cfg.video_tokens], device=device, dtype=torch.int64),
-            persistent=False,
-        )
+        self._rope_key = (cfg.patch_grid, 0, cfg.register_tokens)
 
     def _build(self, cfg: WAMConfig, dtype: torch.dtype) -> None:
         # Patchify. The checkpoint stores this as a Conv3d of stride patch_size,
@@ -399,25 +447,34 @@ class CausalWanDiT(nn.Module):
 
     def forward(
         self,
-        latent: torch.Tensor,  # [B, video_tokens, patch_dim] noisy, patchified
-        actions: torch.Tensor,  # [B, num_action_per_block, action_dim] noisy actions
-        state: torch.Tensor,  # [B, num_state_per_block, max_state_dim]
+        latent: torch.Tensor,  # [B, video_tokens, patch_dim] patchified latent
+        actions: torch.Tensor | None,  # [B, num_action_per_block, action_dim]
+        state: torch.Tensor | None,  # [B, num_state_per_block, max_state_dim]
         timestep: torch.Tensor,  # [B] flow-matching time
         ctx: CrossAttnCache,
         kv_cache: KVCache | None = None,
         embodiment: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns ``(video_noise, action_noise)``."""
+        frames: int | None = None,
+        write_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Returns ``(video_noise, action_noise)``; the latter is None when
+        ``actions`` is None, which is how a cache-priming pass runs."""
         cfg = self.cfg
         if embodiment is None:
             embodiment = torch.zeros(latent.shape[0], dtype=torch.long, device=latent.device)
 
+        video_tokens = latent.shape[1]
+        frames = frames if frames is not None else video_tokens // cfg.frame_seqlen
+
         # [ video | actions | state ] -- one sequence through one transformer.
-        x = torch.cat((
-            self.patch_embed(latent),
-            self.action_encoder(actions, timestep, embodiment),
-            self.state_encoder(state, embodiment),
-        ), dim=1)
+        # Priming runs video-only: the model is being shown a clean frame to
+        # fill the cache, not asked to denoise anything.
+        parts = [self.patch_embed(latent)]
+        if actions is not None:
+            parts.append(self.action_encoder(actions, timestep, embodiment))
+            parts.append(self.state_encoder(state, embodiment))
+        x = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+        n_register = x.shape[1] - video_tokens
 
         t = torch.nn.functional.silu(
             self.time_embed_in(sinusoidal_embedding(timestep, cfg.freq_dim).to(x.dtype))
@@ -426,17 +483,31 @@ class CausalWanDiT(nn.Module):
         e = self.time_projection(torch.nn.functional.silu(t)).view(-1, 6, cfg.dim)
 
         seq_len = x.shape[1]
+        grid = (frames, cfg.latent_height, cfg.latent_width)
+        key = (grid, self.start_frame, n_register)
+        if key != self._rope_key:
+            self.rope_cos, self.rope_sin = rope_tables(
+                cfg, grid, self.start_frame, self.rope_cos.device, self.dtype,
+                register_tokens=n_register,
+            )
+            self._rope_key = key
         cos, sin = self.rope_cos[:seq_len], self.rope_sin[:seq_len]
 
+        # No mask. During cached inference causality is enforced by *what is in
+        # the cache* -- strictly older blocks -- not by masking within the call,
+        # so every query sees the whole history plus its own block, including
+        # the action register. Masking here as well would additionally hide the
+        # register from the video tokens, which upstream does not do.
         for layer, block in enumerate(self.blocks):
-            x = block(x, e, cos, sin, ctx.layers[layer], kv_cache, layer, self.block_boundaries)
+            x = block(x, e, cos, sin, ctx.layers[layer], kv_cache, layer, None, write_cache)
 
-        if kv_cache is not None:
-            kv_cache.commit(seq_len)
+        if kv_cache is not None and write_cache:
+            kv_cache.commit(video_tokens + n_register)
 
         # The head takes the raw time embedding; its own [1, 2, dim] modulation
         # broadcasts against [B, 1, dim] to give the shift/scale pair.
-        video_noise = self.head(x[:, : cfg.video_tokens], t.unsqueeze(1))
-        action_slice = x[:, cfg.video_tokens : cfg.video_tokens + cfg.num_action_per_block]
-        action_noise = self.action_decoder(action_slice, embodiment)
-        return video_noise, action_noise
+        video_noise = self.head(x[:, :video_tokens], t.unsqueeze(1))
+        if actions is None:
+            return video_noise, None
+        action_slice = x[:, video_tokens : video_tokens + cfg.num_action_per_block]
+        return video_noise, self.action_decoder(action_slice, embodiment)

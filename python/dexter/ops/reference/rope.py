@@ -7,9 +7,19 @@ import torch
 from dexter.registry import Priority, register
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+def _rope_adjacent(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate adjacent element pairs -- Wan's convention, not split-half.
+
+    ``x`` is ``[B, L, H, D]``; ``cos``/``sin`` are ``[L, D//2]`` and broadcast
+    over batch and heads.
+    """
+    b, seq_len, heads, head_dim = x.shape
+    pairs = x.float().reshape(b, seq_len, heads, head_dim // 2, 2)
+    real, imag = pairs[..., 0], pairs[..., 1]
+    c = cos.float()[None, :, None, :]
+    s = sin.float()[None, :, None, :]
+    out = torch.stack((real * c - imag * s, real * s + imag * c), dim=-1)
+    return out.reshape(b, seq_len, heads, head_dim).to(x.dtype)
 
 
 def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -38,7 +48,4 @@ def qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = _rms(q, q_weight, eps)
     k = _rms(k, k_weight, eps)
-    # cos/sin are [L, D//2] -> broadcast over batch and heads as [1, L, 1, D]
-    cos = torch.cat((cos, cos), dim=-1)[None, :, None, :].to(q.dtype)
-    sin = torch.cat((sin, sin), dim=-1)[None, :, None, :].to(q.dtype)
-    return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
+    return _rope_adjacent(q, cos, sin), _rope_adjacent(k, cos, sin)

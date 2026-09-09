@@ -37,6 +37,10 @@ class WAMConfig:
 
     # Sequence layout
     frame_seqlen: int = 880  # video tokens per frame after patch embedding
+    # Patch grid behind frame_seqlen. 3D rotary needs the (height, width) split,
+    # which the token count alone does not determine.
+    latent_height: int = 22
+    latent_width: int = 40
     num_frame_per_block: int = 1
     num_action_per_block: int = 32
     num_state_per_block: int = 1
@@ -58,6 +62,19 @@ class WAMConfig:
         if self.dim % self.num_heads:
             raise ValueError(f"dim {self.dim} is not divisible by num_heads {self.num_heads}")
         return self.dim // self.num_heads
+
+    def __post_init__(self) -> None:
+        expected = self.latent_height * self.latent_width
+        if expected != self.frame_seqlen:
+            raise ValueError(
+                f"{self.name}: latent grid {self.latent_height}x{self.latent_width} "
+                f"= {expected} tokens, but frame_seqlen is {self.frame_seqlen}"
+            )
+
+    @property
+    def patch_grid(self) -> tuple[int, int, int]:
+        """``(frames, height, width)`` of patch tokens in one block."""
+        return (self.num_frame_per_block, self.latent_height, self.latent_width)
 
     @property
     def patch_dim(self) -> int:
@@ -172,6 +189,8 @@ WAN21_I2V_14B = WAMConfig(
     in_dim=36,
     out_dim=16,
     frame_seqlen=880,
+    latent_height=22,
+    latent_width=40,
     num_frame_per_block=2,
     num_action_per_block=24,
     num_state_per_block=1,
@@ -190,6 +209,8 @@ WAN22_TI2V_5B = WAMConfig(
     in_dim=48,
     out_dim=48,
     frame_seqlen=50,
+    latent_height=5,
+    latent_width=10,
     num_frame_per_block=1,
     num_action_per_block=32,
     num_state_per_block=1,
