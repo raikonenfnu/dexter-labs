@@ -113,3 +113,23 @@ def test_linear_dispatches_on_bits_not_dtype(bits):
     assert m.packed.bits == bits
     out = m(torch.randn(8, 256, device=DEV, dtype=DT))
     assert out.shape == dense.shape and torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("scale", [1.0, 60.0])
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_attention_survives_extreme_scores(scale, sign):
+    """Online softmax must not produce NaN when scores are large or very negative.
+
+    A 14B DiT reaches |q.k| in the tens of thousands by its deeper layers, and
+    the first tile's rescale is the place that overflows if the -inf running
+    max is handled as a number rather than as "nothing accumulated yet".
+    """
+    b, l, h, d = 1, 96, 4, 128
+    q = torch.full((b, l, h, d), sign * scale, device=DEV, dtype=DT)
+    k = torch.full((b, l, h, d), scale, device=DEV, dtype=DT)
+    v = torch.randn(b, l, h, d, device=DEV, dtype=DT)
+    bb = torch.tensor([0, 48], device=DEV)
+    got = ops.blockwise_causal_attention(q, k, v, block_boundaries=bb)
+    assert torch.isfinite(got.float()).all(), "attention produced non-finite output"
+    exp = ref("attention", "blockwise_causal")(q, k, v, None, 0, bb, None)
+    close(got, exp, tol=3e-2)

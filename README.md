@@ -256,6 +256,74 @@ meaningful robot commands and the arm does not accomplish the reach. What is
 real here is the timing — when chunks arrive, how long the arm waits, and
 whether the control period is met. That is the same quantity the post measured.
 
+## Running the released 14B checkpoint
+
+`GEAR-Dreams/DreamZero-DROID` loads and runs. The DiT is 27.3 GB in bf16 on a
+32 GB machine that also holds the OS, so it is packed to int4 *as it streams*
+rather than after:
+
+```
+$ dexter-demo --model 14b --checkpoint ~/nod/checkpoints/DreamZero-DROID --bits 4
+loaded in 27.4s
+resident weights : 9.06 GB      (bf16 would be 27.26 GB)
+peak GPU alloc   : 10.24 GB     (of 34.4 GB)
+```
+
+The parameter mapping validates **1317 to 1317 tensors, nothing unfilled and
+nothing unused** — the check that makes a silently half-loaded model impossible.
+Building the model to match the release rather than the paper turned up six
+real corrections, each of which would otherwise have been a quiet wrong answer:
+
+| what the release actually does | what a sketch would assume |
+|---|---|
+| `patch_embedding` is a Conv3d of stride `(1,2,2)` — a linear over `in_dim * 4 = 144` | a linear over `in_dim` |
+| text is projected to `dim` *before* any block, so cross-attn k/v are `dim -> dim` | `text_dim -> dim` |
+| i2v cross-attends to CLIP image features too (`k_img`/`v_img`), summed with text | text only |
+| action/state encoders are per-embodiment (category-specific) linears | plain linears |
+| `WanRMSNorm` reduces over the full 5120 `dim`, across all heads | per-head over `head_dim` |
+| `in_dim` 36 = 16 denoised + 20 conditioning channels; `out_dim` is only the 16 | the whole input is noisy |
+
+The fifth of those meant the fused `qk_norm_rope` kernel was computing a
+different model, and it was rewritten as a `[heads, head_dim/2]` tile with a
+whole-plane reduction.
+
+### Measured, real weights
+
+```
+run 0: step 20407 ms = device 20405 (denoise: 5598 4917 4930 4960) + host 2.5
+run 1: step 19853 ms = device 19851 (denoise: 4947 4967 4970 4966) + host 2.1
+
+action chunk (1, 24, 32) finite=True
+  action[0] (7 joints + gripper): 0.023 -0.023 0.034 -0.036 -0.039 -0.031 0.068 -0.039
+  chunk drift |a[23]-a[0]| = 0.049
+```
+
+20.1 s per control step, against a 6.6 s compute floor. The gap is the
+quantised GEMM being ~1.8x off dense, and at 1785 tokens this model is firmly
+compute bound — so int4 here buys the ability to *load* the model, and costs
+time. bf16 would be faster per step and does not fit.
+
+The joint deltas are small and smooth, and drift gently across the chunk, which
+is what a trained policy should emit. They are still not *meaningful* commands,
+for a reason worth stating precisely: the DiT is real, but its three encoders
+are not. The VAE (observation to latent), CLIP (frame conditioning) and umt5
+(language) live in shards 1-2 of the release and are neither downloaded nor
+implemented here, so the conditioning fed to the DiT is a placeholder of the
+right shape. Real weights, synthetic observations.
+
+### A bug this surfaced
+
+The first real-weights run returned NaN. Activations stayed bounded through 32
+layers and then went non-finite at block 33 — sudden, not a gradual overflow.
+It was the online-softmax rescale in the attention kernel: before the first
+visible tile there is nothing accumulated and `running_max` is `-inf`, which the
+kernel replaced with `0.0` and then used as `exp(0 - safe_max)`. With scores
+near -5e4, that is `+inf`, and `0 * inf` in the accumulator is NaN. The
+correction has to be *zero* in that case, not an exponential. Randomly
+initialised weights never produce scores extreme enough to reach it; the real
+checkpoint does by layer 33. There is now a regression test that drives
+attention with deliberately extreme scores.
+
 ## Layout
 
 ```
@@ -269,11 +337,12 @@ python/dexter/
     gfx1151/           RDNA3.5 kernels: norm, rope, gemm, attention
   models/
     layers.py          Linear that swaps dense <-> packed in place
-    dreamzero/         config (from upstream Hydra), DiT, closed-loop policy
+    dreamzero/         config, DiT, closed-loop policy
+      checkpoint.py    streaming loader: meta build, pack-as-you-go, one shard mapped
   runtime/graph.py     HIP graph capture of the denoise step
   demo/robot.py        closed-loop arm, blocking vs pipelined chunk scheduling
   bench/               roofline, kernel microbench, end-to-end
-test/                  34 tests: kernels vs references, model, scheduler
+test/                  37 tests: kernels vs references, model, scheduler
 ```
 
 Adding an architecture is one row in `platform._AMD_ARCHS` plus a directory of
@@ -303,13 +372,10 @@ pytest test -q
 
 ## What is not here
 
-* **Real checkpoint loading.** The model is built to the upstream config shapes
-  and benchmarked with initialised weights. Loading `GEAR-Dreams/DreamZero-DROID`
-  needs a parameter-name mapping that is not written, and the 14B checkpoint is
-  45 GB against 32 GB of shared memory — it needs int4 packing during load, not
-  after.
-* **VAE and text encoder.** The engine serves the DiT, which is where a step
-  spends its time. Observations enter as latents and instructions as embeddings.
-  The fused Conv3D from the post is not implemented.
+* **The three encoders.** The DiT runs on real weights; the VAE, CLIP and umt5
+  encoders around it do not exist here, so observations and instructions enter
+  as correctly-shaped placeholders. This is the gap between "the engine runs the
+  model" and "the robot does the task", and it is the next thing to build. The
+  fused Conv3D from the post is part of that VAE work.
 * **A competitive int4 GEMM.** Diagnosed, not fixed. See above.
 * **Multi-GPU.** Upstream shards across 2+ GPUs; this is a single-APU engine.

@@ -84,7 +84,17 @@ def _attention_kernel(
             new_max = tl.maximum(running_max, tile_max)
             # A fully masked tile leaves new_max at -inf; clamp so exp stays finite.
             safe_max = tl.where(new_max == float("-inf"), 0.0, new_max)
-            correction = tl.exp(tl.where(running_max == float("-inf"), 0.0, running_max) - safe_max)
+
+            # The rescale factor for what is already accumulated. Before the
+            # first visible tile there is nothing accumulated and running_max is
+            # -inf, which must give a correction of *zero*, not exp(0 - max):
+            # with strongly negative scores that expression overflows to +inf
+            # and the 0 * inf in the accumulator update becomes NaN. Real
+            # weights reach scores near -5e4 by layer 33, so this is reachable,
+            # not theoretical.
+            correction = tl.where(
+                running_max == float("-inf"), 0.0, tl.exp(running_max - safe_max)
+            )
             p = tl.exp(scores - safe_max[:, None])
             p = tl.where(visible, p, 0.0)
 
