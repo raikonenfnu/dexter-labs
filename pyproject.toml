@@ -14,6 +14,7 @@ dev = ["pytest", "rich"]
 
 [project.scripts]
 dexter-bench = "dexter.bench.__main__:main"
+dexter-demo = "dexter.demo.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

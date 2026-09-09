@@ -200,6 +200,62 @@ Reading this honestly:
   reduction, at 30 layers of a 5B backbone. That is the axis on which it is
   the enabling technique for the 14B, which does not otherwise fit.
 
+## Robotics demo: the latency that actually reaches the arm
+
+`dexter-demo` drives a 7-DoF arm through the same closed-loop contract as
+upstream's `eval_utils/run_sim_eval.py`: the policy returns a 32-action chunk,
+only `open_loop_horizon` (8) of them execute, then it is re-queried. Upstream
+that query is a **blocking** websocket call, so the robot stops moving for the
+whole inference.
+
+At DROID's 15 Hz, 8 actions is 533 ms of motion, and a 5B step is ~400 ms. The
+arm therefore spends nearly half its life frozen:
+
+```
+$ dexter-demo --model 5b --ticks 150 --horizon 8 --prefetch 4 8
+scheduler       rate      calls              stalled       worst      deadline misses
+blocking          9.0 Hz   19 calls  stall  7.94s (47.6%)  worst  488.4 ms  misses  19/150
+pipelined/pf4    12.7 Hz   19 calls  stall  3.10s (26.2%)  worst  405.8 ms  misses  19/150
+pipelined/pf8    14.5 Hz   19 calls  stall  0.40s ( 3.9%)  worst  399.1 ms  misses   1/150
+```
+
+**Blocking loses 47.6% of wall time to inference stalls** — 9.0 Hz against a
+15 Hz target, and a deadline miss on every chunk boundary. Starting the next
+inference `prefetch` actions before the current chunk runs dry overlaps it with
+motion the arm already has queued. A prefetch of 8 buys 533 ms of cover for a
+~400 ms step and takes the arm to **14.5 Hz with one miss in 150**.
+
+The residual 0.40 s is a cold start, and irreducible: the first chunk has no
+predecessor to hide behind. Every later inference is fully overlapped.
+
+The tempting alternative is to lengthen the open loop instead. It works, and it
+is worse:
+
+```
+$ dexter-demo --model 5b --ticks 150 --horizon 16 --prefetch 8 16
+blocking         11.1 Hz   10 calls  stall  4.12s (30.6%)  worst  456.3 ms  misses  10/150
+pipelined/pf8    14.5 Hz   10 calls  stall  0.40s ( 3.9%)  worst  402.7 ms  misses   1/150
+```
+
+Doubling the horizon does cut blocking's stalls (47.6% → 30.6%) by querying
+half as often, but it never reaches pipelining's 3.9%, and it pays for the
+improvement in **observation staleness** — 16 actions is 1.07 s of acting on a
+picture of the world that old. Pipelining reaches a better number while still
+re-planning every 533 ms. On this hardware, overlap the inference; do not
+lengthen the open loop to hide it.
+
+Worth putting next to the post's headline: its three optimisations moved
+MI300X from 564.7 ms to 398.3 ms, a 1.42x on inference latency. Scheduling the
+same inference against the chunk it already has took **9.0 Hz to 14.5 Hz, a
+1.6x on the rate the arm actually achieves**, without touching a kernel. Both
+matter, but on a bandwidth-poor part the scheduling one is available first and
+costs a thread.
+
+Caveat, stated plainly: the weights are uninitialised, so the actions are not
+meaningful robot commands and the arm does not accomplish the reach. What is
+real here is the timing — when chunks arrive, how long the arm waits, and
+whether the control period is met. That is the same quantity the post measured.
+
 ## Layout
 
 ```
@@ -215,8 +271,9 @@ python/dexter/
     layers.py          Linear that swaps dense <-> packed in place
     dreamzero/         config (from upstream Hydra), DiT, closed-loop policy
   runtime/graph.py     HIP graph capture of the denoise step
+  demo/robot.py        closed-loop arm, blocking vs pipelined chunk scheduling
   bench/               roofline, kernel microbench, end-to-end
-test/                  28 tests: every kernel against its reference
+test/                  34 tests: kernels vs references, model, scheduler
 ```
 
 Adding an architecture is one row in `platform._AMD_ARCHS` plus a directory of
@@ -240,6 +297,7 @@ dexter-bench platform     # capabilities, bandwidth, kernel selection
 dexter-bench roofline     # where each config sits on the roofline
 dexter-bench kernels      # fused kernels vs torch references
 dexter-bench e2e --model 5b --layers 30 --bits 16 8 4 --graph
+dexter-demo  --model 5b --ticks 150 --prefetch 4 8   # closed-loop robot demo
 pytest test -q
 ```
 
