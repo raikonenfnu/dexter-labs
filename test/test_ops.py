@@ -161,3 +161,39 @@ def test_input_and_output_patch_inverses_are_distinct():
     assert torch.equal(unpatchify(patchify_output(x), grid, 16), x)
     # Swapping them survives the shape check but scrambles each patch.
     assert not torch.equal(unpatchify(patchify(x), grid, 16), x)
+
+
+@pytest.mark.parametrize("cache_len", [0, 32])
+def test_attention_causal_matches_reference(cache_len):
+    """Token-causal masking reuses the same kernel via a different limit vector."""
+    b, l, h, d = 1, 64, 4, 128
+    q = torch.randn(b, l, h, d, device=DEV, dtype=DT) * 0.3
+    k = torch.randn_like(q); v = torch.randn_like(q)
+    cache = torch.randn(2, b, 128, h, d, device=DEV, dtype=DT) * 0.3 if cache_len else None
+    got = ops.blockwise_causal_attention(q, k, v, kv_cache=cache,
+                                         cache_len=cache_len, causal=True)
+    exp = ref("attention", "blockwise_causal")(q, k, v, cache, cache_len, None, None, True)
+    close(got, exp, tol=3e-2)
+    # A causal query must not see the future: the last key changes only the last row.
+    k2 = k.clone(); k2[:, -1] += 5.0
+    other = ops.blockwise_causal_attention(q, k2, v, kv_cache=cache,
+                                           cache_len=cache_len, causal=True)
+    assert torch.allclose(got[:, :-1].float(), other[:, :-1].float(), atol=2e-2)
+
+
+@pytest.mark.parametrize("interleaved", [True, False])
+def test_qk_norm_rope_both_pairings(interleaved):
+    """Wan pairs adjacent elements; Qwen3 pairs a half-offset. Both must work."""
+    b, l, h, d = 1, 48, 8, 128
+    q = torch.randn(b, l, h, d, device=DEV, dtype=DT)
+    k = torch.randn_like(q)
+    w = torch.randn(h * d, device=DEV, dtype=DT)
+    pos = torch.arange(l, device=DEV, dtype=torch.float32)[:, None]
+    inv = 1.0 / (10000 ** (torch.arange(0, d, 2, device=DEV, dtype=torch.float32) / d))[None, :]
+    cos, sin = torch.cos(pos * inv).to(DT), torch.sin(pos * inv).to(DT)
+    gq, gk = ops.qk_norm_rope(q, k, w, w, cos, sin, interleaved=interleaved)
+    rq, rk = ref("rope", "qk_norm_rope")(q, k, w, w, cos, sin, 1e-6, interleaved)
+    close(gq, rq); close(gk, rk)
+    # The two conventions must actually differ, or the flag is a no-op.
+    other, _ = ops.qk_norm_rope(q, k, w, w, cos, sin, interleaved=not interleaved)
+    assert not torch.allclose(gq.float(), other.float(), atol=1e-3)

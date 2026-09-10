@@ -71,14 +71,19 @@ def qk_norm_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
     eps: float = 1e-6,
+    interleaved: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm then RoPE on q and k, fused.
+
+    ``interleaved`` selects the rotary pairing: adjacent elements (Wan) or a
+    half-offset (Qwen3 and most HF models). They are not interchangeable.
 
     ``q``/``k`` are ``[B, L, H, D]``; ``cos``/``sin`` are ``[L, D // 2]``.
     Wan applies QK-norm and rotary back to back, and neither is worth its own
     round trip at these sequence lengths.
     """
-    return select("rope", "qk_norm_rope", q, k)(q, k, q_weight, k_weight, cos, sin, eps)
+    return select("rope", "qk_norm_rope", q, k)(
+        q, k, q_weight, k_weight, cos, sin, eps, interleaved)
 
 
 def linear(
@@ -128,6 +133,7 @@ def blockwise_causal_attention(
     cache_len: int = 0,
     block_boundaries: torch.Tensor | None = None,
     softmax_scale: float | None = None,
+    causal: bool = False,
 ) -> torch.Tensor:
     """Attention over ``[video tokens | action register]`` with block causality.
 
@@ -137,7 +143,7 @@ def blockwise_causal_attention(
     what a single closed-loop step looks like once history is in the cache.
     """
     return select("attention", "blockwise_causal", q, k, v)(
-        q, k, v, kv_cache, cache_len, block_boundaries, softmax_scale
+        q, k, v, kv_cache, cache_len, block_boundaries, softmax_scale, causal
     )
 
 

@@ -24,10 +24,17 @@ def block_causal_mask(
     cache_len: int,
     block_boundaries: torch.Tensor | None,
     device: torch.device,
+    causal: bool = False,
 ) -> torch.Tensor:
     """``[q_len, cache_len + q_len]`` bool mask; True means "may attend"."""
     mask = torch.zeros(q_len, cache_len + q_len, dtype=torch.bool, device=device)
     mask[:, :cache_len] = True  # history is always visible
+
+    if causal:
+        rows = torch.arange(q_len, device=device)[:, None]
+        cols = torch.arange(q_len, device=device)[None, :]
+        mask[:, cache_len:] = cols <= rows
+        return mask
 
     if block_boundaries is None:
         mask[:, cache_len:] = True
@@ -49,6 +56,7 @@ def blockwise_causal_attention(
     cache_len: int,
     block_boundaries: torch.Tensor | None,
     softmax_scale: float | None,
+    causal: bool = False,
 ) -> torch.Tensor:
     """q, k, v are ``[B, L, H, D]``. ``kv_cache`` is ``[2, B, S, H, D]``."""
     b, q_len, h, d = q.shape
@@ -62,7 +70,7 @@ def blockwise_causal_attention(
     qt, kt, vt = (t.transpose(1, 2) for t in (q, k, v))
     logits = torch.matmul(qt.float(), kt.float().transpose(-1, -2)) * scale
 
-    mask = block_causal_mask(q_len, cache_len, block_boundaries, q.device)
+    mask = block_causal_mask(q_len, cache_len, block_boundaries, q.device, causal)
     logits = logits.masked_fill(~mask, float("-inf"))
 
     out = torch.matmul(torch.softmax(logits, dim=-1), vt.float())

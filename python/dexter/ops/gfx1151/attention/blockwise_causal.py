@@ -115,13 +115,22 @@ def visibility_limits(
     cache_len: int,
     block_boundaries: torch.Tensor | None,
     device: torch.device,
+    causal: bool = False,
 ) -> torch.Tensor:
     """Per-query index of the last visible key.
 
     Cached history is always visible, so every limit is at least
     ``cache_len - 1``. Inside the current call, a query in the block starting at
     ``starts[i]`` sees up to the end of that block.
+
+    Because the kernel takes a *limit per query* rather than a mask shape, the
+    three masks this engine needs are three different vectors over the same
+    kernel: full attention (every query sees everything), token-causal (query
+    ``i`` sees up to ``i``), and block-causal (query sees to the end of its
+    block). Adding the causal case cost a vector, not a kernel.
     """
+    if causal:
+        return (cache_len + torch.arange(q_len, device=device)).to(torch.int32)
     if block_boundaries is None:
         return torch.full((q_len,), cache_len + q_len - 1, dtype=torch.int32, device=device)
 
@@ -136,7 +145,8 @@ def visibility_limits(
 
 @register("attention", "blockwise_causal", name="triton_blockwise_causal_gfx1151",
           capability=RDNA3, priority=Priority.PERFORMANT)
-def blockwise_causal_attention(q, k, v, kv_cache, cache_len, block_boundaries, softmax_scale):
+def blockwise_causal_attention(q, k, v, kv_cache, cache_len, block_boundaries,
+                               softmax_scale, causal=False):
     b, q_len, heads, head_dim = q.shape
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
 
@@ -147,7 +157,7 @@ def blockwise_causal_attention(q, k, v, kv_cache, cache_len, block_boundaries, s
 
     kv_len = k.shape[1]
     out = torch.empty_like(q)
-    limits = visibility_limits(q_len, cache_len, block_boundaries, q.device)
+    limits = visibility_limits(q_len, cache_len, block_boundaries, q.device, causal)
 
     block_m = min(max(triton.next_power_of_2(q_len), 16), 64)
     block_n = 64

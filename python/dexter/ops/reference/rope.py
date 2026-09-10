@@ -7,19 +7,23 @@ import torch
 from dexter.registry import Priority, register
 
 
-def _rope_adjacent(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate adjacent element pairs -- Wan's convention, not split-half.
+def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+          interleaved: bool) -> torch.Tensor:
+    """Apply rotary in either pairing convention.
 
-    ``x`` is ``[B, L, H, D]``; ``cos``/``sin`` are ``[L, D//2]`` and broadcast
-    over batch and heads.
+    ``interleaved`` pairs (2j, 2j+1) -- Wan; otherwise (j, j + D/2) -- Qwen3
+    and most HF models. ``x`` is ``[B, L, H, D]``, ``cos``/``sin`` ``[L, D//2]``.
     """
     b, seq_len, heads, head_dim = x.shape
-    pairs = x.float().reshape(b, seq_len, heads, head_dim // 2, 2)
-    real, imag = pairs[..., 0], pairs[..., 1]
     c = cos.float()[None, :, None, :]
     s = sin.float()[None, :, None, :]
-    out = torch.stack((real * c - imag * s, real * s + imag * c), dim=-1)
-    return out.reshape(b, seq_len, heads, head_dim).to(x.dtype)
+    if interleaved:
+        pairs = x.float().reshape(b, seq_len, heads, head_dim // 2, 2)
+        real, imag = pairs[..., 0], pairs[..., 1]
+        out = torch.stack((real * c - imag * s, real * s + imag * c), dim=-1)
+        return out.reshape(b, seq_len, heads, head_dim).to(x.dtype)
+    real, imag = x.float().split(head_dim // 2, dim=-1)
+    return torch.cat((real * c - imag * s, real * s + imag * c), dim=-1).to(x.dtype)
 
 
 def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -45,7 +49,8 @@ def qk_norm_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
     eps: float,
+    interleaved: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = _rms(q, q_weight, eps)
     k = _rms(k, k_weight, eps)
-    return _rope_adjacent(q, cos, sin), _rope_adjacent(k, cos, sin)
+    return _rope(q, cos, sin, interleaved), _rope(k, cos, sin, interleaved)

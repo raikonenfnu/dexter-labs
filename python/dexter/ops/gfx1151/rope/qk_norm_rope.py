@@ -31,6 +31,7 @@ def _qk_norm_rope_kernel(
     q_out_ptr, k_out_ptr,
     seq_len, dim, eps,
     HEADS: tl.constexpr, HALF: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
 ):
     """One program per (batch, token).
 
@@ -49,9 +50,17 @@ def _qk_norm_rope_kernel(
     mask = (heads < HEADS) & (half < HALF)
 
     head_dim = 2 * HALF
-    # Adjacent pairing: element 2j and 2j+1 of each head.
-    lo_off = heads * head_dim + 2 * half
-    hi_off = lo_off + 1
+    # Two rotary conventions live in this engine and they are not
+    # interchangeable: Wan pairs *adjacent* elements (2j, 2j+1), while Qwen3 and
+    # most HF models pair a half-offset (j, j + head_dim/2). Picking the wrong
+    # one still runs and silently destroys positional structure, so it is an
+    # explicit flag rather than a default.
+    if INTERLEAVED:
+        lo_off = heads * head_dim + 2 * half
+        hi_off = lo_off + 1
+    else:
+        lo_off = heads * head_dim + half
+        hi_off = lo_off + HALF
     base = pid * dim
 
     q_lo = tl.load(q_ptr + base + lo_off, mask=mask, other=0.0).to(tl.float32)
@@ -83,7 +92,7 @@ def _qk_norm_rope_kernel(
 
 @register("rope", "qk_norm_rope", name="triton_qk_norm_rope_gfx1151",
           capability=RDNA3, priority=Priority.PERFORMANT)
-def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, eps):
+def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, eps, interleaved=True):
     b, seq_len, heads, head_dim = q.shape
     q, k = q.contiguous(), k.contiguous()
     q_out, k_out = torch.empty_like(q), torch.empty_like(k)
@@ -95,6 +104,7 @@ def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, eps):
         seq_len, heads * head_dim, eps,
         HEADS=heads, HALF=half,
         BLOCK_H=triton.next_power_of_2(heads), BLOCK_D=triton.next_power_of_2(half),
+        INTERLEAVED=interleaved,
         num_warps=4,
     )
     return q_out, k_out
