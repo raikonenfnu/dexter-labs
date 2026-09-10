@@ -82,9 +82,9 @@ def load_policy(device: str = "cuda", repo: str = "lerobot/diffusion_pusht"):
     normalises, which is also the version-proof option: the arithmetic below
     is fixed by the checkpoint, not by whichever lerobot is installed.
     """
-    from dexter.demo._lerobot_compat import install
+    from dexter.vla.compat import install_lerobot_shims
 
-    install()
+    install_lerobot_shims()
     from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
     policy = DiffusionPolicy.from_pretrained(repo)

@@ -496,78 +496,51 @@ success.
 
 ## Evaluating π0.5-DROID on real DROID data
 
-`dexter-droid-eval` scores the policy against ground-truth teleoperator actions
-from a slice of `lerobot/droid_1.0.1` (1074 episodes, 321k frames at 15 Hz).
+`dexter-eval` scores predicted action chunks against ground-truth teleoperator
+actions from a slice of `lerobot/droid_1.0.1`.
 
 ```
-$ dexter-droid-eval --samples 40 --draws 5
-samples 40  horizon 15
-                          policy  do-nothing
-  joints MAE (rad/s)     0.1661      0.1527
-  correlation(pred, true) pooled: +0.140
-  per-sample correlation: median +0.240  quartiles -0.097/+0.494
-    tracking (r>0.5):   25% of samples   anti/uncorrelated (r<0):   28%
+$ dexter-eval --samples 100
+pi05_droid: chunk 15 @ 15 Hz (1000 ms budget)
+dataset: 327 decodable episodes of 1074 in the shard
+
+samples 100  horizon 15
+  MAE            0.1612   do-nothing 0.1701   (1.06x better)
+  correlation    +0.456 pooled, +0.499 median per sample
+  tracking       50% of samples at r>0.5, 17% uncorrelated
+  latency        435 ms/chunk vs 1000 ms budget  (2.30x headroom)
 ```
 
-**This is not a working evaluation, and the number should not be quoted as
-π0.5's quality.** A correctly wired π0.5-DROID should track its own training
-distribution far better than one sample in four. Something in this pipeline is
-still wrong, and it is recorded here rather than buried.
+It tracks the demonstrator on half the samples, beats the do-nothing baseline,
+and clears its control-rate deadline 2.3x over. For a *generative* policy scored
+against one specific operator's choices this is the shape you want: it agrees
+most of the time and picks a different valid strategy the rest.
 
-### What *is* verified
+### Seven contract errors, and the one that dominated
 
-Each of these was wrong at some point and produced plausible-looking output:
+Every one of these ran without error while producing wrong results.
 
 | | how it was settled |
 |---|---|
-| action space | openpi's action statistics are centred near zero with std ~0.2 — **joint velocities**, not the position targets in LeRobot's `action` column. Confirmed by matching q01 against every candidate column: `action.joint_velocity` scores L1 0.19, `action` scores 6.23. |
-| state | `observation.state.joint_position` (7) + gripper (1), matched the same way. |
-| statistics | must be **openpi's training** `norm_stats.json`, not the LeRobot port's `meta/stats.json`. The two disagree about what an action is. |
-| images | passed at native 180×320 in [0,1]; the model does its own `resize_with_pad`. Pre-resizing bilinearly distorts, then gets padded again. |
-| absent camera | DROID has no right wrist. The key is **omitted**, so lerobot pads with −1 and masks it — matching openpi's `image_mask=False`. Passing zeros instead leaves it unmasked. |
-| padding order | state padded to 32 *before* normalising; actions unnormalised at 32 then sliced to 8. |
-| sampler | `num_inference_steps=10`, matching openpi. |
-| normalisation mode | quantile, not z-score: openpi sets `use_quantile_norm = model_type != PI0`. |
-| **prompt format** | openpi's order is `Normalize -> TokenizePrompt -> PadStatesAndActions`, so the discrete state in the prompt is DROID's **8** numbers. Padding to 32 first (or letting the state tokeniser pad) appends 24 filler bins to every prompt. The prompt now matches openpi byte for byte: `Task: ..., State: 99 13 118 41 110 56 113 0;\nAction: ` |
+| **wrong episode's frames** | The dominant bug. A downloaded slice's data shard indexes 1074 episodes but the downloaded videos cover 327. Seeking a missing episode's timestamp lands in *another* episode's video and returns a real-looking frame. 327/1074 ≈ 30% matched the observed "tracking" rate almost exactly. `LeRobotSlice` now resolves availability up front. |
+| action space | joint **velocities**, not LeRobot's `action` column (position targets). Matched openpi's q01 against every candidate: `action.joint_velocity` L1 0.19, `action` 6.23; mean/std agree too. |
+| statistics | openpi's **training** `norm_stats.json`, not the port's `meta/stats.json`. |
+| prompt format | openpi's order is `Normalize -> TokenizePrompt -> Pad`, so the prompt carries DROID's **8** state numbers. Padding first appends 24 filler bins. |
+| images | native resolution in [0,1]; the model does its own `resize_with_pad`. |
+| absent camera | omit the key so it is padded with −1 and masked, matching `image_mask=False`. |
+| output width | unnormalise at the robot's width, then slice — statistics are not 32-wide. |
 
-Fixing these moved joints MAE 0.337 → 0.166 rad/s and left correlation at
-+0.145 (+0.220 on frames with real motion), 27% of samples tracking. The fact
-that correlation barely moved while MAE improved is the tell: what remains is
-not a calibration problem.
+Fixing these moved correlation +0.121 → **+0.456** and MAE from 1.3x worse than
+doing nothing to 1.06x better.
 
-Correlation at the **first** predicted step is +0.058 — the model cannot predict
-even the immediately next action, which is the easiest one, and correlation
-*rises* with horizon rather than falling. That rules out "the 15-step lookahead
-is simply hard" and points at the model path itself.
+### Two reporting rules this earned
 
-Input ablations confirm nothing is being ignored: perturbing the instruction,
-the state or the images each moves the output substantially (0.11-0.32 mean
-absolute change), so language, state and vision all reach the model.
-
-### Why the metric alone would mislead
-
-Two traps worth stating, because either could be used to make this look fine:
-
-* **"Do nothing" is a strong baseline.** The action space is velocity and DROID
-  teleop is often near-stationary, so commanding zero scores 0.153 rad/s MAE
-  while having no relationship to the task. Any MAE reported without it beside
-  it means nothing.
-* **π0.5 is generative.** It samples one plausible chunk by flow matching, and a
-  plausible chunk need not be the one this operator chose. Hence the per-sample
-  correlation *distribution* rather than a pooled scalar, and the `--draws`
-  option. Averaging 5 draws did improve MAE to near parity with do-nothing —
-  but left correlation flat, which is why generative variance is not a
-  sufficient explanation.
-
-### What would settle it
-
-Differential-testing against openpi's own implementation on identical inputs —
-the same technique that found the DreamZero bug in one run after hours of
-guessing. openpi's reference is JAX, so that conflicts with keeping this stack
-PyTorch-only; it would have to be a throwaway environment used once to dump
-reference tensors, not a dependency. The alternative suspects, in order: the
-fidelity of lerobot's PI05 port for this checkpoint (which carries config fields
-that lerobot version does not know), and the discrete-state tokenizer step.
+* **Always print the trivial baseline.** The action space is velocity and teleop
+  is often near-stationary, so commanding zero scores 0.170 MAE while having no
+  relationship to the task.
+* **Report correlation as a distribution.** A flow-matching policy samples one
+  plausible chunk; a pooled scalar cannot separate "usually tracks" from "never
+  tracks". The per-sample median and the r>0.5 fraction can.
 
 ## Layout
 
@@ -589,10 +562,11 @@ python/dexter/
   demo/robot.py        closed-loop arm, blocking vs pipelined chunk scheduling
   demo/rollout.py      world-model rollout from a real frame
   demo/pusht.py        a small policy solving a real task, end to end
-  demo/pi05.py         pi0.5-DROID timed against DROID's control rate
-  demo/droid_eval.py   pi0.5 scored against real DROID teleop actions
+  vla/                 VLA policies behind one interface + a name registry
+  data/lerobot.py      partial-dataset reader (resolves what is decodable)
+  eval/chunk.py        action-chunk scoring with baselines
   bench/               roofline, kernel microbench, end-to-end
-test/                  41 tests: kernels vs references, model, scheduler, layouts
+test/                  46 tests: kernels, model, scheduler, layouts, VLA, data
 ```
 
 Adding an architecture is one row in `platform._AMD_ARCHS` plus a directory of
