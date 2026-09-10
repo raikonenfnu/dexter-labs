@@ -494,6 +494,68 @@ at eval time. Compute is identical either way, so the latency above is sound,
 but the action *values* are not calibrated and this is not an evaluation of task
 success.
 
+## Evaluating π0.5-DROID on real DROID data
+
+`dexter-droid-eval` scores the policy against ground-truth teleoperator actions
+from a slice of `lerobot/droid_1.0.1` (1074 episodes, 321k frames at 15 Hz).
+
+```
+$ dexter-droid-eval --samples 40 --draws 5
+samples 40  horizon 15
+                          policy  do-nothing
+  joints MAE (rad/s)     0.1661      0.1527
+  correlation(pred, true) pooled: +0.140
+  per-sample correlation: median +0.240  quartiles -0.097/+0.494
+    tracking (r>0.5):   25% of samples   anti/uncorrelated (r<0):   28%
+```
+
+**This is not a working evaluation, and the number should not be quoted as
+π0.5's quality.** A correctly wired π0.5-DROID should track its own training
+distribution far better than one sample in four. Something in this pipeline is
+still wrong, and it is recorded here rather than buried.
+
+### What *is* verified
+
+Each of these was wrong at some point and produced plausible-looking output:
+
+| | how it was settled |
+|---|---|
+| action space | openpi's action statistics are centred near zero with std ~0.2 — **joint velocities**, not the position targets in LeRobot's `action` column. Confirmed by matching q01 against every candidate column: `action.joint_velocity` scores L1 0.19, `action` scores 6.23. |
+| state | `observation.state.joint_position` (7) + gripper (1), matched the same way. |
+| statistics | must be **openpi's training** `norm_stats.json`, not the LeRobot port's `meta/stats.json`. The two disagree about what an action is. |
+| images | passed at native 180×320 in [0,1]; the model does its own `resize_with_pad`. Pre-resizing bilinearly distorts, then gets padded again. |
+| absent camera | DROID has no right wrist. The key is **omitted**, so lerobot pads with −1 and masks it — matching openpi's `image_mask=False`. Passing zeros instead leaves it unmasked. |
+| padding order | state padded to 32 *before* normalising; actions unnormalised at 32 then sliced to 8. |
+| sampler | `num_inference_steps=10`, matching openpi. |
+
+Fixing these moved joints MAE 0.337 → 0.166 rad/s. Correlation barely moved
+(+0.12 → +0.14), which is the tell: the remaining error is not calibration.
+
+### Why the metric alone would mislead
+
+Two traps worth stating, because either could be used to make this look fine:
+
+* **"Do nothing" is a strong baseline.** The action space is velocity and DROID
+  teleop is often near-stationary, so commanding zero scores 0.153 rad/s MAE
+  while having no relationship to the task. Any MAE reported without it beside
+  it means nothing.
+* **π0.5 is generative.** It samples one plausible chunk by flow matching, and a
+  plausible chunk need not be the one this operator chose. Hence the per-sample
+  correlation *distribution* rather than a pooled scalar, and the `--draws`
+  option. Averaging 5 draws did improve MAE to near parity with do-nothing —
+  but left correlation flat, which is why generative variance is not a
+  sufficient explanation.
+
+### What would settle it
+
+Differential-testing against openpi's own implementation on identical inputs —
+the same technique that found the DreamZero bug in one run after hours of
+guessing. openpi's reference is JAX, so that conflicts with keeping this stack
+PyTorch-only; it would have to be a throwaway environment used once to dump
+reference tensors, not a dependency. The alternative suspects, in order: the
+fidelity of lerobot's PI05 port for this checkpoint (which carries config fields
+that lerobot version does not know), and the discrete-state tokenizer step.
+
 ## Layout
 
 ```
@@ -515,6 +577,7 @@ python/dexter/
   demo/rollout.py      world-model rollout from a real frame
   demo/pusht.py        a small policy solving a real task, end to end
   demo/pi05.py         pi0.5-DROID timed against DROID's control rate
+  demo/droid_eval.py   pi0.5 scored against real DROID teleop actions
   bench/               roofline, kernel microbench, end-to-end
 test/                  41 tests: kernels vs references, model, scheduler, layouts
 ```

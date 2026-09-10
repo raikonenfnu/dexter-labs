@@ -18,6 +18,7 @@ dexter-demo = "dexter.demo.__main__:main"
 dexter-rollout = "dexter.demo.rollout_cli:main"
 dexter-pusht = "dexter.demo.pusht_cli:main"
 dexter-pi05 = "dexter.demo.pi05_cli:main"
+dexter-droid-eval = "dexter.demo.droid_eval_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

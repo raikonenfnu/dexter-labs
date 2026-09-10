@@ -210,16 +210,13 @@ def droid_observation(frames: dict[str, np.ndarray], joint_state: np.ndarray,
     which is how DROID's 8-DoF (7 joints + gripper) reaches a model trained
     across embodiments of differing width.
     """
-    import torch.nn.functional as F
-
     batch = {}
     for key in CAMERA_KEYS:
-        img = torch.from_numpy(frames[key]).float().permute(2, 0, 1)[None]
-        img = F.interpolate(img, size=(IMAGE_SIZE, IMAGE_SIZE),
-                            mode="bilinear", align_corners=False)
-        # The preprocessor normalises; hand it [0, 1] and no batch dimension,
-        # which is the layout its AddBatchDimension step expects.
-        batch[key] = (img[0] / 255.0).to(device=device, dtype=torch.float32)
+        # Native resolution, [0, 1], channels-first, unbatched. The model does
+        # its own resize_with_pad to 224x224; interpolating here first would
+        # distort the aspect ratio before that padding is applied.
+        img = torch.from_numpy(frames[key]).float().permute(2, 0, 1) / 255.0
+        batch[key] = img.to(device=device, dtype=torch.float32)
 
     state = torch.zeros(32, dtype=torch.float32, device=device)
     state[: len(joint_state)] = torch.from_numpy(joint_state)
