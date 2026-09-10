@@ -439,6 +439,61 @@ threshold. Reporting it as "coverage" showed episodes at 1.00 that the env had
 not marked solved. The demo reports `info["coverage"]` and `info["is_success"]`
 instead — which lowered the headline number and made it true.
 
+## A SOTA VLA that does keep up: π0.5-DROID
+
+The 14B world model misses DROID's control rate by ~24x. A current
+vision-language-action model does not:
+
+```
+$ dexter-pi05 --video-dir <droid mp4s>
+lerobot/pi05_droid: 3.62B params, 7.47 GB resident (bf16), chunk_size 15
+
+median   424.0 ms/chunk   budget 1000.0 ms (15 actions @ 15 Hz)   2.36x   KEEPS UP
+  per-chunk ms: [422, 427, 424, 424, 413]
+  peak GPU: 7.72 GB of 34.4
+```
+
+π0.5 is DROID-native — same Franka, same 15 Hz, same action space — so nothing
+is fine-tuned or adapted. `chunk_size` is 15, so one inference buys exactly
+1.0 s of motion; that, not the 66.7 ms tick, is the deadline, and 424 ms clears
+it with room for the prefetch scheduling in `demo/robot.py`.
+
+At 58% of this machine's measured 29.5 TFLOP/s for a ~1000-token prefill, that
+number is about what the roofline predicts. The reason it works where an
+equally-sized autoregressive VLA would not is decode strategy, not size: π0.5
+runs **one** prefill then a few passes over a small action expert by flow
+matching, while a token-autoregressive VLA pays a full pass over 7 GB of weights
+per action token — ~32 ms each at 233 GB/s, so a few dozen tokens exhausts the
+budget on memory traffic alone. On a bandwidth-poor part that choice is
+decisive, and it is the same lesson as the int4 GEMM and the DreamZero roofline.
+
+Everything runs on PyTorch. openpi's own path is JAX, but LeRobot ships a
+PyTorch port of π0.5 and `lerobot/pi05_droid` is a PyTorch checkpoint, so no
+JAX, TensorFlow or weight conversion is involved.
+
+### What the checkpoint needed to load
+
+The published checkpoint is newer than the pinned lerobot, and two of the gaps
+could have changed behaviour silently rather than erroring:
+
+* `config.json` carries fields `PI05Config` rejects. They are dropped **only
+  after checking their values** — `use_relative_actions` is the one that would
+  change the action space, and it is `false`. `compat_checkpoint()` raises
+  rather than strips if a future checkpoint enables it.
+* Both processor pipelines reference `relative_actions_processor` /
+  `absolute_actions_processor` steps this lerobot has no implementation for.
+  Both are `enabled: false`, so they are removed; an enabled one raises.
+* LeRobot's π0.5 refuses to build without a patched `transformers`. openpi ships
+  those files, and `demo/_transformers_patch.py` applies them with `.orig`
+  backups and a `revert()`.
+
+**Caveat on the actions, not the timing.** This checkpoint ships no
+normalisation statistics — both normalizer steps have empty `features`, and
+there are none in the weights either; they are expected from the DROID dataset
+at eval time. Compute is identical either way, so the latency above is sound,
+but the action *values* are not calibrated and this is not an evaluation of task
+success.
+
 ## Layout
 
 ```
@@ -459,6 +514,7 @@ python/dexter/
   demo/robot.py        closed-loop arm, blocking vs pipelined chunk scheduling
   demo/rollout.py      world-model rollout from a real frame
   demo/pusht.py        a small policy solving a real task, end to end
+  demo/pi05.py         pi0.5-DROID timed against DROID's control rate
   bench/               roofline, kernel microbench, end-to-end
 test/                  41 tests: kernels vs references, model, scheduler, layouts
 ```
