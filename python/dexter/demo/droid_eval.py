@@ -144,7 +144,12 @@ class EvalResult:
         return "\n".join(lines)
 
 
-def load_stats(path: str | Path) -> dict:
+# DROID's real state/action width: 7 joints + 1 gripper. The model pads to 32
+# internally, but everything *before* the model works at this width.
+DROID_DIM = 8
+
+
+def load_stats(path: str | Path, width: int = DROID_DIM) -> dict:
     """Normalisation statistics from openpi's *training* assets.
 
     These must be the statistics the checkpoint was trained with, not whatever
@@ -159,7 +164,7 @@ def load_stats(path: str | Path) -> dict:
     rename = {"state": "observation.state", "actions": "action"}
     out = {}
     for src, dst in rename.items():
-        out[dst] = {k: torch.tensor(v, dtype=torch.float32)
+        out[dst] = {k: torch.tensor(v, dtype=torch.float32)[:width]
                     for k, v in norm[src].items() if k in ("mean", "std", "q01", "q99")}
     return out
 
@@ -245,7 +250,23 @@ def load_policy_with_stats(checkpoint: str, stats: dict, device: str = "cuda",
     ckpt = compat_checkpoint(checkpoint, dtype=str(dtype).replace("torch.", ""))
     policy = PI05Policy.from_pretrained(ckpt).to(device=device).eval()
     policy.config.device = device
-    pre, post = make_pi05_pre_post_processors(policy.config, dataset_stats=stats)
+
+    # The processors normalise and tokenise at DROID's true width; the model
+    # pads to max_state_dim itself. Declaring 32 here would make the normaliser
+    # expect 32-wide inputs and put 32 numbers in the prompt.
+    import copy
+
+    cfg = copy.deepcopy(policy.config)
+    width = len(next(iter(stats.values()))["q01"])
+    for features in (cfg.input_features, cfg.output_features):
+        for name, feat in features.items():
+            if name in stats:
+                features[name] = type(feat)(type=feat.type, shape=(width,))
+    # The state tokeniser pads to max_state_dim before discretising. openpi
+    # tokenises *before* padding, so its prompts carry DROID's 8 numbers; left
+    # at 32 this appends 24 filler bins to every prompt.
+    cfg.max_state_dim = width
+    pre, post = make_pi05_pre_post_processors(cfg, dataset_stats=stats)
     return policy, pre, post
 
 
@@ -283,12 +304,12 @@ def evaluate(policy, pre, post, slice_: "DroidSlice", *, samples: int = 20,
         # pad it with -1 and set its attention mask to zero, which is what
         # openpi does (image_mask=False). Passing a zeros image instead would
         # be unmasked, so the model would attend to a black frame as if real.
-        # openpi's statistics are 32-dim (DROID's 8 dims plus zero padding), so
-        # the state must be padded to 32 *before* normalisation rather than
-        # inside the model.
-        padded = torch.zeros(policy.config.max_state_dim, dtype=torch.float32)
-        padded[: len(state)] = torch.from_numpy(state)
-        batch["observation.state"] = padded.to(device)
+        # Feed the *unpadded* 8-dim state. openpi's transform order is
+        # TokenizePrompt -> PadStatesAndActions, so the discrete state tokens in
+        # the prompt describe 8 numbers, not 32. Padding first put 24 extra "0"
+        # tokens into every prompt -- the model still ran, and still produced
+        # actions, but they had almost no relationship to the observation.
+        batch["observation.state"] = torch.from_numpy(state).to(device)
 
         policy.reset()
         processed = pre({**batch, "task": task})
@@ -300,10 +321,10 @@ def evaluate(policy, pre, post, slice_: "DroidSlice", *, samples: int = 20,
                                for _ in range(draws)]).mean(0)
         else:
             raw = policy.predict_action_chunk(processed)
-        # Unnormalise all 32 dims (the statistics are 32-wide), then keep
-        # DROID's first 8 -- the order openpi's DroidOutputs uses.
-        chunk = post(raw[:, :horizon])
-        preds.append(chunk[0, :, :8].float().cpu().numpy())
+        # Statistics are now DROID-width, so slice the model's padded output
+        # before unnormalising -- exactly what openpi's DroidOutputs does.
+        chunk = post(raw[:, :horizon, :DROID_DIM])
+        preds.append(chunk[0].float().cpu().numpy())
         truths.append(actions)
         states.append(state)
 

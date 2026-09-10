@@ -527,9 +527,22 @@ Each of these was wrong at some point and produced plausible-looking output:
 | absent camera | DROID has no right wrist. The key is **omitted**, so lerobot pads with −1 and masks it — matching openpi's `image_mask=False`. Passing zeros instead leaves it unmasked. |
 | padding order | state padded to 32 *before* normalising; actions unnormalised at 32 then sliced to 8. |
 | sampler | `num_inference_steps=10`, matching openpi. |
+| normalisation mode | quantile, not z-score: openpi sets `use_quantile_norm = model_type != PI0`. |
+| **prompt format** | openpi's order is `Normalize -> TokenizePrompt -> PadStatesAndActions`, so the discrete state in the prompt is DROID's **8** numbers. Padding to 32 first (or letting the state tokeniser pad) appends 24 filler bins to every prompt. The prompt now matches openpi byte for byte: `Task: ..., State: 99 13 118 41 110 56 113 0;\nAction: ` |
 
-Fixing these moved joints MAE 0.337 → 0.166 rad/s. Correlation barely moved
-(+0.12 → +0.14), which is the tell: the remaining error is not calibration.
+Fixing these moved joints MAE 0.337 → 0.166 rad/s and left correlation at
++0.145 (+0.220 on frames with real motion), 27% of samples tracking. The fact
+that correlation barely moved while MAE improved is the tell: what remains is
+not a calibration problem.
+
+Correlation at the **first** predicted step is +0.058 — the model cannot predict
+even the immediately next action, which is the easiest one, and correlation
+*rises* with horizon rather than falling. That rules out "the 15-step lookahead
+is simply hard" and points at the model path itself.
+
+Input ablations confirm nothing is being ignored: perturbing the instruction,
+the state or the images each moves the output substantially (0.11-0.32 mean
+absolute change), so language, state and vision all reach the model.
 
 ### Why the metric alone would mislead
 
